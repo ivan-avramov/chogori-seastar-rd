@@ -1,4 +1,4 @@
-FROM ubuntu:20.04
+FROM ubuntu:25.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt update && apt upgrade -y && apt install -y \
@@ -23,9 +23,6 @@ RUN apt update && apt upgrade -y && apt install -y \
     scons \
     git \
     sed;
-
-# easy way to get cmake 3.17
-RUN pip3 install cmake
 
 VOLUME [ "/build" ]
 WORKDIR /build

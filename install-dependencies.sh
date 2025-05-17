@@ -240,7 +240,7 @@ cd deps
 if [ ! -d "fmt" ]; then git clone https://github.com/fmtlib/fmt.git; fi
 
 cd fmt
-git checkout 7.1.3
+git checkout 11.2.0
 mkdir -p build
 cd build
 cmake ..
