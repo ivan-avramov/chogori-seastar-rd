@@ -22,18 +22,20 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <seastar/core/thread_impl.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/scheduling.hh>
 #include <memory>
-#include <setjmp.h>
 #include <type_traits>
-#include <chrono>
+#include <seastar/util/assert.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/modules.hh>
 #include <ucontext.h>
 #include <boost/intrusive/list.hpp>
+#endif
 
 /// \defgroup thread-module Seastar threads
 ///
@@ -70,7 +72,7 @@ namespace seastar {
 
 /// \addtogroup thread-module
 /// @{
-
+SEASTAR_MODULE_EXPORT_BEGIN
 class thread;
 class thread_attributes;
 
@@ -81,7 +83,7 @@ public:
     // For stack_size 0, a default value will be used (128KiB when writing this comment)
     size_t stack_size = 0;
 };
-
+SEASTAR_MODULE_EXPORT_END
 
 /// \cond internal
 extern thread_local jmp_buf_link g_unthreaded_context;
@@ -133,7 +135,7 @@ public:
 
 /// \endcond
 
-
+SEASTAR_MODULE_EXPORT
 /// \brief thread - stateful thread of execution
 ///
 /// Threads allow using seastar APIs in a blocking manner,
@@ -167,7 +169,7 @@ public:
     /// \brief Destroys a \c thread object.
     ///
     /// The thread must not represent a running thread of execution (see join()).
-    ~thread() { assert(!_context || _context->_joined); }
+    ~thread() { SEASTAR_ASSERT(!_context || _context->_joined); }
     /// \brief Waits for thread execution to terminate.
     ///
     /// Waits for thread execution to terminate, and marks the thread object as not
@@ -182,13 +184,19 @@ public:
     ///
     /// Useful where we cannot call yield() immediately because we
     /// Need to take some cleanup action first.
-    static bool should_yield();
+    static bool should_yield() {
+        return need_preempt();
+    }
 
     /// \brief Yield if this thread ought to call yield() now.
     ///
     /// Useful where a code does long running computation and does
     /// not want to hog cpu for more then its share
-    static void maybe_yield();
+    static void maybe_yield() {
+        if (should_yield()) [[unlikely]] {
+            yield();
+        }
+    }
 
     static bool running_in_thread() {
         return thread_impl::get() != nullptr;
@@ -214,6 +222,7 @@ thread::join() {
     return _context->_done.get_future();
 }
 
+SEASTAR_MODULE_EXPORT_BEGIN
 /// Executes a callable in a seastar thread.
 ///
 /// Runs a block of code in a threaded context,
@@ -239,15 +248,15 @@ thread::join() {
 /// \endcode
 template <typename Func, typename... Args>
 inline
-futurize_t<std::result_of_t<std::decay_t<Func>(std::decay_t<Args>...)>>
+futurize_t<std::invoke_result_t<Func, Args...>>
 async(thread_attributes attr, Func&& func, Args&&... args) noexcept {
-    using return_type = std::result_of_t<std::decay_t<Func>(std::decay_t<Args>...)>;
+    using return_type = std::invoke_result_t<Func, Args...>;
     struct work {
         thread_attributes attr;
         Func func;
         std::tuple<Args...> args;
-        promise<return_type> pr;
-        thread th;
+        promise<return_type> pr{};
+        thread th{};
     };
 
     try {
@@ -276,10 +285,11 @@ async(thread_attributes attr, Func&& func, Args&&... args) noexcept {
 /// \return whatever \c func returns, as a future.
 template <typename Func, typename... Args>
 inline
-futurize_t<std::result_of_t<std::decay_t<Func>(std::decay_t<Args>...)>>
+futurize_t<std::invoke_result_t<Func, Args...>>
 async(Func&& func, Args&&... args) noexcept {
     return async(thread_attributes{}, std::forward<Func>(func), std::forward<Args>(args)...);
 }
 /// @}
 
+SEASTAR_MODULE_EXPORT_END
 }

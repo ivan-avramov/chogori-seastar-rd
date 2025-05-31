@@ -43,6 +43,7 @@
 #include <seastar/core/print.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/packet-data-source.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/std-compat.hh>
 #include <seastar/util/log.hh>
 #include "ascii.hh"
@@ -162,8 +163,8 @@ public:
         , _key_size(key.key().size())
         , _ascii_prefix_size(ascii_prefix.size())
     {
-        assert(_key_size <= std::numeric_limits<uint8_t>::max());
-        assert(_ascii_prefix_size <= std::numeric_limits<uint8_t>::max());
+        SEASTAR_ASSERT(_key_size <= std::numeric_limits<uint8_t>::max());
+        SEASTAR_ASSERT(_ascii_prefix_size <= std::numeric_limits<uint8_t>::max());
         // storing key
         memcpy(_data, key.key().c_str(), _key_size);
         // storing ascii_prefix
@@ -255,7 +256,7 @@ public:
     }
 
     friend inline void intrusive_ptr_add_ref(item* it) {
-        assert(it->_ref_count >= 0);
+        SEASTAR_ASSERT(it->_ref_count >= 0);
         ++it->_ref_count;
         if (it->_ref_count == 2) {
             slab->lock_item(it);
@@ -269,7 +270,7 @@ public:
         } else if (it->_ref_count == 0) {
             slab->free(it);
         }
-        assert(it->_ref_count >= 0);
+        SEASTAR_ASSERT(it->_ref_count >= 0);
     }
 
     friend struct item_key_cmp;
@@ -469,7 +470,7 @@ private:
         intrusive_ptr_add_ref(new_item);
 
         auto insert_result = _cache.insert(*new_item);
-        assert(insert_result.second);
+        SEASTAR_ASSERT(insert_result.second);
         if (insertion.expiry.ever_expires() && _alive.insert(*new_item)) {
             _timer.rearm(new_item->get_timeout());
         }
@@ -1250,12 +1251,18 @@ private:
         std::vector<packet> _out_bufs;
         ascii_protocol _proto;
 
+        static output_stream_options make_opts() noexcept {
+            output_stream_options opts;
+            opts.trim_to_size = true;
+            return opts;
+        }
+
         connection(ipv4_addr src, uint16_t request_id, input_stream<char>&& in, size_t out_size,
                 sharded_cache& c, distributed<system_stats>& system_stats)
             : _src(src)
             , _request_id(request_id)
             , _in(std::move(in))
-            , _out(output_stream<char>(data_sink(std::make_unique<vector_data_sink>(_out_bufs)), out_size, true))
+            , _out(output_stream<char>(data_sink(std::make_unique<vector_data_sink>(_out_bufs)), out_size, make_opts()))
             , _proto(c, system_stats)
         {}
 
@@ -1284,10 +1291,10 @@ public:
     }
 
     void start() {
-        _chan = make_udp_channel({_port});
+        _chan = make_bound_datagram_channel({_port});
         // Run in the background.
         _task = keep_doing([this] {
-            return _chan.receive().then([this](udp_datagram dgram) {
+            return _chan.receive().then([this](datagram dgram) {
                 packet& p = dgram.get_data();
                 if (p.len() < sizeof(header)) {
                     // dropping invalid packet
@@ -1367,7 +1374,7 @@ public:
     void start() {
         listen_options lo;
         lo.reuse_address = true;
-        _listener = seastar::server_socket(seastar::listen(make_ipv4_address({_port}), lo));
+        _listener = make_lw_shared<seastar::server_socket>(seastar::listen(make_ipv4_address({_port}), lo));
         // Run in the background until eof has reached on the input connection.
         _task = keep_doing([this] {
             return _listener->accept().then([this] (accept_result ar) mutable {
@@ -1447,10 +1454,10 @@ int main(int ac, char** av) {
         ;
 
     return app.run_deprecated(ac, av, [&] {
-        engine().at_exit([&] { return tcp_server.stop(); });
-        engine().at_exit([&] { return udp_server.stop(); });
-        engine().at_exit([&] { return cache_peers.stop(); });
-        engine().at_exit([&] { return system_stats.stop(); });
+        internal::at_exit([&] { return tcp_server.stop(); });
+        internal::at_exit([&] { return udp_server.stop(); });
+        internal::at_exit([&] { return cache_peers.stop(); });
+        internal::at_exit([&] { return system_stats.stop(); });
 
         auto&& config = app.configuration();
         uint16_t port = config["port"].as<uint16_t>();

@@ -19,22 +19,35 @@
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <sys/socket.h>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <functional>
 #include <unordered_map>
-#include <forward_list>
 #include <utility>
 #include <string>
 #include <map>
 #include <iostream>
 #include <unordered_map>
 
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/core/seastar.hh>
 #include <seastar/core/scollectd_api.hh>
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/print.hh>
+#include <seastar/core/shared_ptr.hh>
 
 #include "core/scollectd-impl.hh"
+#endif
+#include <seastar/util/assert.hh>
 
 namespace seastar {
 
@@ -85,8 +98,9 @@ registration::registration(type_instance_id&& id)
 }
 
 seastar::metrics::impl::metric_id to_metrics_id(const type_instance_id & id) {
-    return seastar::metrics::impl::metric_id(id.plugin(), id.type_instance(),
-            {{seastar::metrics::shard_label.name(), seastar::metrics::impl::shard()}});
+    seastar::metrics::impl::labels_type labels {{seastar::metrics::shard_label.name(), seastar::metrics::impl::shard()}};
+    auto internalized_labels = make_lw_shared<seastar::metrics::impl::labels_type>(std::move(labels));
+    return seastar::metrics::impl::metric_id(id.plugin(), id.type_instance(), std::move(internalized_labels));
 }
 
 
@@ -121,7 +135,7 @@ struct cpwriter {
     typedef buffer_type::iterator mark_type;
     typedef buffer_type::const_iterator const_mark_type;
 
-    buffer_type _buf;
+    buffer_type _buf = {};
     mark_type _pos;
     bool _overflow = false;
 
@@ -163,12 +177,12 @@ struct cpwriter {
         return *this;
     }
 
-    sstring get_type_instance(const seastar::metrics::impl::metric_id & id) {
-        if (id.labels().empty()) {
-            return id.name();
+    sstring get_type_instance(const metrics::metric_name_type& name, const metrics::impl::labels_type& labels) {
+        if (labels.empty()) {
+            return name;
         }
-        sstring res = id.name();
-        for (auto i : id.labels()) {
+        sstring res = name;
+        for (auto i : labels) {
             if (i.first != seastar::metrics::shard_label.name()) {
                 res += "-" + i.second;
             }
@@ -189,7 +203,7 @@ struct cpwriter {
         return *this;
     }
     template<typename T>
-    typename std::enable_if<std::is_integral<T>::value, cpwriter &>::type write(
+    std::enable_if_t<std::is_integral_v<T>, cpwriter &> write(
             const T & t) {
         T tmp = net::hton(t);
         auto * p = reinterpret_cast<const uint8_t *>(&tmp);
@@ -198,7 +212,7 @@ struct cpwriter {
         return *this;
     }
     template<typename T>
-    typename std::enable_if<std::is_integral<T>::value, cpwriter &>::type write_le(const T & t) {
+    std::enable_if_t<std::is_integral_v<T>, cpwriter &> write_le(const T & t) {
         T tmp = cpu_to_le(t);
         auto * p = reinterpret_cast<const uint8_t *>(&tmp);
         auto * e = p + sizeof(T);
@@ -215,12 +229,11 @@ struct cpwriter {
                 break;
             }
             case data_type::COUNTER:
-            case data_type::DERIVE:
-            case data_type::ABSOLUTE:
-                write(v.ui()); // big endian
+            case data_type::REAL_COUNTER:
+                write(v.ui()); // unsigned int 64, big endian
                 break;
             default:
-                assert(0);
+                SEASTAR_ASSERT(0);
         }
     }
     cpwriter & write(const sstring & s) {
@@ -242,7 +255,7 @@ struct cpwriter {
         return *this;
     }
     template<typename T>
-    typename std::enable_if<std::is_integral<T>::value, cpwriter &>::type put(
+    std::enable_if_t<std::is_integral_v<T>, cpwriter &> put(
             part_type type, T t) {
         write(uint16_t(type));
         write(uint16_t(4 + sizeof(t)));
@@ -275,7 +288,8 @@ struct cpwriter {
         }
         return *this;
     }
-    cpwriter & put(const sstring & host, const seastar::metrics::impl::metric_id & id, const type_id& type) {
+    cpwriter & put(const sstring & host, const metrics::group_name_type& group_name, const metrics::metric_name_type& name,
+            const metrics::impl::labels_type& labels, const type_id& type) {
         const auto ts = std::chrono::system_clock::now().time_since_epoch();
         const auto lrts =
                 std::chrono::duration_cast<std::chrono::seconds>(ts).count();
@@ -285,14 +299,15 @@ struct cpwriter {
         // Seems hi-res timestamp does not work very well with
         // at the very least my default collectd in fedora (or I did it wrong?)
         // Use lo-res ts for now, it is probably quite sufficient.
-        put_cached(part_type::Plugin, id.group_name());
+        put_cached(part_type::Plugin, group_name);
         // Optional
+        auto instance_id = labels.at(metrics::shard_label.name());
         put_cached(part_type::PluginInst,
-                id.instance_id() == per_cpu_plugin_instance ?
-                        to_sstring(this_shard_id()) : id.instance_id());
+                instance_id == per_cpu_plugin_instance ?
+                        to_sstring(this_shard_id()) : instance_id);
         put_cached(part_type::Type, type);
         // Optional
-        put_cached(part_type::TypeInst, get_type_instance(id));
+        put_cached(part_type::TypeInst, get_type_instance(name, labels));
         return *this;
     }
     cpwriter & put(const sstring & host,
@@ -300,7 +315,8 @@ struct cpwriter {
             const type_instance_id & id, const value_list & v) {
         const auto ps = std::chrono::duration_cast<collectd_hres_duration>(
                         period).count();
-            put(host, to_metrics_id(id), id.type());
+            auto mid = to_metrics_id(id);
+            put(host, mid.group_name(), mid.name(), mid.labels(), id.type());
             put(part_type::Values, v);
             if (ps != 0) {
                 put(part_type::IntervalHr, ps);
@@ -311,10 +327,11 @@ struct cpwriter {
     cpwriter & put(const sstring & host,
             const duration & period,
             const type_id& type,
-            const seastar::metrics::impl::metric_id & id, const seastar::metrics::impl::metric_value & v) {
+            const metrics::group_name_type& group_name, const metrics::metric_name_type& name,
+            const metrics::impl::labels_type& labels, const seastar::metrics::impl::metric_value & v) {
         const auto ps = std::chrono::duration_cast<collectd_hres_duration>(
                 period).count();
-        put(host, id, type);
+        put(host, group_name, name, labels, type);
         put(part_type::Values, v);
         if (ps != 0) {
             put(part_type::IntervalHr, ps);
@@ -348,7 +365,8 @@ future<> impl::send_metric(const type_instance_id & id,
 future<> impl::send_notification(const type_instance_id & id,
         const sstring & msg) {
     cpwriter out;
-    out.put(_host, to_metrics_id(id), id.type());
+    auto mid = to_metrics_id(id);
+    out.put(_host, mid.group_name(), mid.name(), mid.labels(), id.type());
     out.put(part_type::Message, msg);
     return _chan.send(_addr, net::packet(out.data(), out.size()));
 }
@@ -358,7 +376,7 @@ void impl::start(const sstring & host, const ipv4_addr & addr, const duration pe
     _period = period;
     _addr = addr;
     _host = host;
-    _chan = make_udp_channel();
+    _chan = make_unbound_datagram_channel(AF_INET);
     _timer.set_callback(std::bind(&impl::run, this));
 
     // dogfood ourselves
@@ -366,13 +384,13 @@ void impl::start(const sstring & host, const ipv4_addr & addr, const duration pe
 
     _metrics.add_group("scollectd", {
         // total_bytes      value:DERIVE:0:U
-        sm::make_derive("total_bytes_sent", sm::description("total bytes sent"), _bytes),
+        sm::make_counter("total_bytes_sent", sm::description("total bytes sent"), _bytes),
         // total_requests      value:DERIVE:0:U
-        sm::make_derive("total_requests", sm::description("total requests"), _num_packets),
+        sm::make_counter("total_requests", sm::description("total requests"), _num_packets),
         // latency          value:GAUGE:0:U
         sm::make_gauge("latency", sm::description("avrage latency"), _avg),
         // total_time_in_ms    value:DERIVE:0:U
-        sm::make_derive("total_time_in_ms", sm::description("total time in milliseconds"), _millis),
+        sm::make_counter("total_time_in_ms", sm::description("total time in milliseconds"), _millis),
         // total_values     value:DERIVE:0:U
         sm::make_gauge("total_values", sm::description("current number of values reported"), [this] {return values().size();}),
         // records          value:GAUGE:0:U
@@ -401,7 +419,7 @@ void impl::arm() {
 void impl::run() {
     typedef size_t metric_family_id;
     typedef seastar::metrics::impl::value_vector::iterator value_iterator;
-    typedef seastar::metrics::impl::metric_metadata_vector::iterator metadata_iterator;
+    typedef seastar::metrics::impl::metric_metadata_fifo::iterator metadata_iterator;
     typedef std::tuple<metric_family_id, metadata_iterator, value_iterator, type_id, cpwriter> context;
 
     auto ctxt = make_lw_shared<context>();
@@ -443,7 +461,8 @@ void impl::run() {
                     continue;
                 }
                 auto m = out.mark();
-                out.put(_host, _period, std::get<type_id>(*ctxt), md_iterator->id, *i);
+                out.put(_host, _period, std::get<type_id>(*ctxt),
+                    md_iterator->group_name(), md_iterator->name(), md_iterator->labels(), *i);
                 if (!out) {
                     out.reset(m);
                     out_of_space = true;
@@ -525,17 +544,17 @@ future<> send_metric(const type_instance_id & id,
     return get_impl().send_metric(id, values);
 }
 
-void configure(const boost::program_options::variables_map & opts) {
-    bool enable = opts["collectd"].as<bool>();
+void configure(const options& opts) {
+    bool enable = opts.collectd.get_value();
     if (!enable) {
         return;
     }
-    auto addr = ipv4_addr(opts["collectd-address"].as<std::string>());
-    auto period = std::chrono::milliseconds(opts["collectd-poll-period"].as<unsigned>());
+    auto addr = ipv4_addr(opts.collectd_address.get_value());
+    auto period = std::chrono::milliseconds(opts.collectd_poll_period.get_value());
 
-    auto host = (opts["collectd-hostname"].as<std::string>() == "")
+    auto host = (opts.collectd_hostname.get_value() == "")
             ? seastar::metrics::impl::get_local_impl()->get_config().hostname
-            : sstring(opts["collectd-hostname"].as<std::string>());
+            : sstring(opts.collectd_hostname.get_value());
 
     // Now create send loops on each cpu
     for (unsigned c = 0; c < smp::count; c++) {
@@ -546,24 +565,25 @@ void configure(const boost::program_options::variables_map & opts) {
     }
 }
 
-boost::program_options::options_description get_options_description() {
-    namespace bpo = boost::program_options;
-    bpo::options_description opts("COLLECTD options");
-    opts.add_options()("collectd", bpo::value<bool>()->default_value(false),
-            "enable collectd daemon")("collectd-address",
-            bpo::value<std::string>()->default_value("239.192.74.66:25826"),
-            "address to send/broadcast metrics to")("collectd-poll-period",
-            bpo::value<unsigned>()->default_value(1000),
-            "poll period - frequency of sending counter metrics (default: 1000ms, 0 disables)")(
-            "collectd-hostname",
-            bpo::value<std::string>()->default_value(""),
-            "Deprecated option, use metrics-hostname instead");
-    return opts;
+options::options(program_options::option_group* parent_group)
+    : program_options::option_group(parent_group, "COLLECTD options")
+    , collectd(*this, "collectd", false,
+            "enable collectd daemon")
+    , collectd_address(*this, "collectd-address",
+            "239.192.74.66:25826",
+            "address to send/broadcast metrics to")
+    , collectd_poll_period(*this, "collectd-poll-period",
+            1000,
+            "poll period - frequency of sending counter metrics (default: 1000ms, 0 disables)")
+    , collectd_hostname(*this, "collectd-hostname",
+            "",
+            "Deprecated option, use metrics-hostname instead")
+{
 }
 
 static seastar::metrics::impl::register_ref get_register(const scollectd::type_instance_id& i) {
     seastar::metrics::impl::metric_id id = to_metrics_id(i);
-    return seastar::metrics::impl::get_value_map().at(id.full_name()).at(id.labels());
+    return seastar::metrics::impl::get_value_map().at(id.full_name()).at(id.internalized_labels());
 }
 
 std::vector<collectd_value> get_collectd_value(
@@ -970,6 +990,12 @@ metrics::impl::value_map get_value_map() {
     return metrics::impl::get_value_map();
 }
 
+}
+
+thread_local scollectd::impl scollectd_impl;
+
+scollectd::impl & scollectd::get_impl() {
+    return scollectd_impl;
 }
 
 }

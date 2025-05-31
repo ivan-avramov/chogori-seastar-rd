@@ -21,17 +21,23 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <iosfwd>
 #include <sys/types.h>
 #include <netinet/in.h>
+#include <optional>
 #include <stdexcept>
 #include <vector>
+#endif
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/util/modules.hh>
 
 namespace seastar {
 namespace net {
+
+SEASTAR_MODULE_EXPORT_BEGIN
 
 struct ipv4_address;
 struct ipv6_address;
@@ -112,17 +118,27 @@ public:
     static future<std::vector<inet_address>> find_all(const sstring&, family);
 
     static std::optional<inet_address> parse_numerical(const sstring&);
+
+    bool is_loopback() const noexcept;
+    bool is_addr_any() const noexcept;
 };
 
 std::ostream& operator<<(std::ostream&, const inet_address&);
 std::ostream& operator<<(std::ostream&, const inet_address::family&);
 
+SEASTAR_MODULE_EXPORT_END
 }
 }
 
 namespace std {
+SEASTAR_MODULE_EXPORT
 template<>
 struct hash<seastar::net::inet_address> {
     size_t operator()(const seastar::net::inet_address&) const;
 };
 }
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<seastar::net::inet_address> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<seastar::net::inet_address::family> : fmt::ostream_formatter {};
+#endif

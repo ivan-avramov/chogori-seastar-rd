@@ -1,6 +1,11 @@
 Seastar
 =======
 
+[![Test](https://github.com/scylladb/seastar/actions/workflows/tests.yaml/badge.svg)](https://github.com/scylladb/seastar/actions/workflows/tests.yaml)
+[![Version](https://img.shields.io/github/tag/scylladb/seastar.svg?label=version&colorB=green)](https://github.com/scylladb/seastar/releases)
+[![License: Apache2](https://img.shields.io/github/license/scylladb/seastar.svg)](https://github.com/scylladb/seastar/blob/master/LICENSE)
+[![n00b issues](https://img.shields.io/github/issues/scylladb/seastar/n00b.svg?colorB=green)](https://github.com/scylladb/seastar/labels/n00b)
+
 Introduction
 ------------
 
@@ -29,6 +34,10 @@ then compile:
 ```
 $ ninja -C build/release
 ```
+
+In case there are compilation issues, especially like ```g++: internal compiler error: Killed (program cc1plus)```
+try giving more memory to gcc, either by limiting the amount of threads ( -j1 ) and/or allowing at least 4g ram to your
+machine.
 
 If you're missing a dependency of Seastar, then it is possible to have the configuration process fetch a version of the dependency locally for development.
 
@@ -79,11 +88,13 @@ and with CMake using the `Seastar` package:
 `CMakeLists.txt` for `my_app`:
 
 ```
+set (CMAKE_CXX_STANDARD 23)
+
 find_package (Seastar REQUIRED)
 
 add_executable (my_app
   my_app.cc)
-  
+
 target_link_libraries (my_app
   Seastar::seastar)
 ```
@@ -135,11 +146,13 @@ There are also instructions for building on any host that supports [Docker](doc/
 
 Use of the [DPDK](http://dpdk.org) is [optional](doc/building-dpdk.md).
 
-#### Seastar's C++ dialect: C++17 or C++20
+#### Seastar's C++ standard: C++20 or C++23
 
-Seastar supports both C++17, and C++20. It can be selected with the
-`--c++-dialect=gnu++17` configure option or, if using CMake directly,
-by setting on the `Seastar_CXX_DIALECT` CMake variable.
+Seastar supports both C++20, and C++23. The build defaults to the latest
+standard supported by your compiler, but can be explicitly selected with
+the `--c++-standard` configure option, e.g., `--c++-standard=20`,
+or if using CMake directly, by setting on the `CMAKE_CXX_STANDARD` CMake
+variable.
 
 See the [compatibity statement](doc/compatibility.md) for more information.
 
@@ -153,13 +166,16 @@ The documentation is available on the [web](http://docs.seastar.io/master/index.
 
 Resources
 ---------
-Ask questions and post patches on the development mailing list. Subscription
-information and archives are available [here](https://groups.google.com/forum/#!forum/seastar-dev),
-or just send an email to seastar-dev@googlegroups.com.
 
-Information can be found on the main [project website](http://seastar.io).
+* Seasatar Development Mailing List: Discuss challenges, propose improvements with
+  sending code contributions (patches), and get help from experienced developers.
+  Subscribe or browse archives: [here](https://groups.google.com/forum/#!forum/seastar-dev)
+  (or email seastar-dev@googlegroups.com).
+* GitHub Discussions: For more casual conversations and quick questions, consider
+  using the Seastar project's [discussions on Github](https://github.com/scylladb/seastar/discussions).
+* Issue Tracker: File bug reports on the project's [issue tracker](https://github.com/scylladb/seastar/issues).
 
-File bug reports on the project [issue tracker](https://github.com/scylladb/seastar/issues).
+Learn more about Seastar on the main [project website](http://seastar.io).
 
 The Native TCP/IP Stack
 -----------------------
@@ -188,3 +204,4 @@ Projects using Seastar
 * [redpanda](https://vectorized.io/): A Kafka replacement for mission critical systems
 * [Scylla](https://github.com/scylladb/scylla): A fast and reliable NoSQL data store compatible with Cassandra and DynamoDB
 * [smf](https://github.com/smfrpc/smf): The fastest RPC in the West
+* [Ceph - Crimson](https://github.com/ceph/ceph): Next-generation OSD (Object Storage Daemon) implementation based on the Seastar framework

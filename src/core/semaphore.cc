@@ -19,8 +19,17 @@
  * Copyright (C) 2020 Cloudius Systems, Ltd.
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
 #include <fmt/format.h>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/core/semaphore.hh>
+#endif
 
 namespace seastar {
 
@@ -45,6 +54,10 @@ const char* semaphore_timed_out::what() const noexcept {
     return "Semaphore timedout";
 }
 
+const char* semaphore_aborted::what() const noexcept {
+    return "Semaphore aborted";
+}
+
 semaphore_timed_out semaphore_default_exception_factory::timeout() noexcept {
     static_assert(std::is_nothrow_default_constructible_v<semaphore_timed_out>);
     return semaphore_timed_out();
@@ -53,6 +66,11 @@ semaphore_timed_out semaphore_default_exception_factory::timeout() noexcept {
 broken_semaphore semaphore_default_exception_factory::broken() noexcept {
     static_assert(std::is_nothrow_default_constructible_v<broken_semaphore>);
     return broken_semaphore();
+}
+
+semaphore_aborted semaphore_default_exception_factory::aborted() noexcept {
+    static_assert(std::is_nothrow_default_constructible_v<semaphore_aborted>);
+    return semaphore_aborted();
 }
 
 // A factory of semaphore exceptions that contain additional context: the semaphore name
@@ -67,7 +85,7 @@ static_assert(std::is_nothrow_move_constructible_v<named_semaphore>);
 
 named_semaphore_timed_out::named_semaphore_timed_out(std::string_view msg) noexcept : _msg() {
     try {
-        _msg = format("Semaphore timed out: {}", msg);
+        _msg = seastar::format("Semaphore timed out: {}", msg);
     } catch (...) {
         // ignore, empty _msg will generate a static message in what().
     }
@@ -75,7 +93,15 @@ named_semaphore_timed_out::named_semaphore_timed_out(std::string_view msg) noexc
 
 broken_named_semaphore::broken_named_semaphore(std::string_view msg) noexcept : _msg() {
     try {
-        _msg = format("Semaphore broken: {}", msg);
+        _msg = seastar::format("Semaphore broken: {}", msg);
+    } catch (...) {
+        // ignore, empty _msg will generate a static message in what().
+    }
+}
+
+named_semaphore_aborted::named_semaphore_aborted(std::string_view msg) noexcept : _msg() {
+    try {
+        _msg = seastar::format("Semaphore aborted: {}", msg);
     } catch (...) {
         // ignore, empty _msg will generate a static message in what().
     }
@@ -91,12 +117,21 @@ const char* broken_named_semaphore::what() const noexcept {
     return _msg.empty() ? "Broken named semaphore" : _msg.c_str();
 }
 
+const char* named_semaphore_aborted::what() const noexcept {
+    // return a static message if generating the dynamic message failed.
+    return _msg.empty() ? "Named semaphore aborted" : _msg.c_str();
+}
+
 named_semaphore_timed_out named_semaphore_exception_factory::timeout() const noexcept {
     return named_semaphore_timed_out(name);
 }
 
 broken_named_semaphore named_semaphore_exception_factory::broken() const noexcept {
     return broken_named_semaphore(name);
+}
+
+named_semaphore_aborted named_semaphore_exception_factory::aborted() const noexcept {
+    return named_semaphore_aborted(name);
 }
 
 } // namespace seastar

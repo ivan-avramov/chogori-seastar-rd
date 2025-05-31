@@ -14,7 +14,7 @@ An _indent_ is four spaces. A double indent is eight spaces, a half-indent is tw
 
 ## Naming
 
-We follow the C++ and Boost naming conventions: class names, variables, and functions are `words_separated_by_whitespace`.
+We follow the C++ and Boost naming conventions: class names, variables, functions, and concepts are `words_separated_by_whitespace`.
 
 Private data members are prefixed by an underscore:
 
@@ -30,7 +30,11 @@ public:
 
 Think of the leading underscore as a shorthand for `this->`.
 
-Template parameters and concepts use `CamelCase`
+Template parameters use `CamelCase`
+
+Note: because the Concept Technical Specification used CamelCase for concepts,
+some Seastar concepts alse use CamelCase. These will be gradually deprecated
+and replaced with snake_case names. New concepts should use snake_case.
 
 ## Including header files
 
@@ -45,6 +49,8 @@ In any private file, to include a private header file (one in the `src` director
 ```c++
 #include "core/future_impl.hh"
 ```
+
+Header files in Seastar must be self-contained, i.e., each can be included without having to include specific other headers first. To verify that your change did not break this property, run `ninja checkheaders` in the build directory.
 
 ## Braced blocks
 
@@ -84,7 +90,7 @@ Avoid output parameters; use return values instead.  In/out parameters are trick
 
 If a function accepts a lambda or an `std::function`, make it the last argument, so that it can be easily provided inline:
 
-```c++ 
+```c++
 template <typename Func>
 void function_accepting_a_lambda(int a, int b, Func func);
 
@@ -121,7 +127,7 @@ Whitespace around operators should match their precedence: high precedence = no 
 
 ## Long lines
 
-If a line becomes excessively long (>120 characters?), or is just complicated, break it into two or more lines.  The second (and succeeding lines) are _continuation lines_, and have a double indent:
+If a line becomes excessively long (>160 characters?), or is just complicated, break it into two or more lines.  The second (and succeeding lines) are _continuation lines_, and have a double indent:
 
 ```c++
     if ((some_condition && some_other_condition)

@@ -26,12 +26,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <assert.h>
-#include <memory>
 #include <vector>
 #include <algorithm>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/align.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/util/assert.hh>
 
 namespace seastar {
 
@@ -108,7 +108,7 @@ public:
     }
 
     void* allocate_object() {
-        assert(!_free_objects.empty());
+        SEASTAR_ASSERT(!_free_objects.empty());
         auto object = reinterpret_cast<void*>(_free_objects.back());
         _free_objects.pop_back();
         return object;
@@ -159,7 +159,7 @@ private:
 
         Item& victim = reinterpret_cast<Item&>(_lru.back());
         uint32_t index = victim.get_slab_page_index();
-        assert(victim.is_unlocked());
+        SEASTAR_ASSERT(victim.is_unlocked());
         _lru.erase(_lru.iterator_to(reinterpret_cast<slab_item_base&>(victim)));
         // WARNING: You need to make sure that erase_func will not release victim back to slab.
         erase_func(victim);
@@ -192,7 +192,7 @@ public:
 
     template<typename... Args>
     Item *create(Args&&... args) {
-        assert(!_free_slab_pages.empty());
+        SEASTAR_ASSERT(!_free_slab_pages.empty());
         auto& desc = _free_slab_pages.back();
         auto object = desc.allocate_object();
         if (desc.empty()) {
@@ -208,14 +208,14 @@ public:
                                std::function<void (slab_page_desc& desc)> insert_slab_page_desc,
                                Args&&... args) {
         // allocate slab page.
-        constexpr size_t alignment = std::alignment_of<Item>::value;
+        constexpr size_t alignment = std::alignment_of_v<Item>;
         void *slab_page = aligned_alloc(alignment, max_object_size);
         if (!slab_page) {
             throw std::bad_alloc{};
         }
         // allocate descriptor to slab page.
         slab_page_desc *desc = nullptr;
-        assert(_size % alignment == 0);
+        SEASTAR_ASSERT(_size % alignment == 0);
         try {
             auto objects = max_object_size / _size;
             desc = new slab_page_desc(slab_page, objects, _size, _slab_class_id, slab_page_index);
@@ -267,7 +267,7 @@ public:
     }
 
     void remove_desc_from_free_list(slab_page_desc& desc) {
-        assert(desc.slab_class_id() == _slab_class_id);
+        SEASTAR_ASSERT(desc.slab_class_id() == _slab_class_id);
         _free_slab_pages.erase(_free_slab_pages.iterator_to(desc));
     }
 };
@@ -302,7 +302,7 @@ private:
         }
         // get descriptor of the least-recently-used slab page and related info.
         auto& desc = _slab_page_desc_lru.back();
-        assert(desc.refcnt() == 0);
+        SEASTAR_ASSERT(desc.refcnt() == 0);
         uint8_t slab_class_id = desc.slab_class_id();
         auto slab_class = get_slab_class(slab_class_id);
         void *slab_page = desc.slab_page();
@@ -333,7 +333,7 @@ private:
                 }
             }
             Item* item = reinterpret_cast<Item*>(object);
-            assert(item->is_unlocked());
+            SEASTAR_ASSERT(item->is_unlocked());
             slab_class->remove_item_from_lru(item);
             _erase_func(*item);
             _stats.frees++;
@@ -358,7 +358,7 @@ private:
     }
 
     void initialize_slab_allocator(double growth_factor, uint64_t limit) {
-        constexpr size_t alignment = std::alignment_of<Item>::value;
+        constexpr size_t alignment = std::alignment_of_v<Item>;
         constexpr size_t initial_size = 96;
         size_t size = initial_size; // initial object size
         uint8_t slab_class_id = 0U;
@@ -368,7 +368,7 @@ private:
             _slab_class_sizes.push_back(size);
             _slab_classes.emplace_back(size, slab_class_id);
             size *= growth_factor;
-            assert(slab_class_id < std::numeric_limits<uint8_t>::max());
+            SEASTAR_ASSERT(slab_class_id < std::numeric_limits<uint8_t>::max());
             slab_class_id++;
         }
         _slab_class_sizes.push_back(_max_object_size);
@@ -393,15 +393,15 @@ private:
     }
 
     slab_class<Item>* get_slab_class(const uint8_t slab_class_id) {
-        assert(slab_class_id >= 0 && slab_class_id < _slab_classes.size());
+        SEASTAR_ASSERT(slab_class_id >= 0 && slab_class_id < _slab_classes.size());
         return &_slab_classes[slab_class_id];
     }
 
     void register_metrics() {
         namespace sm = seastar::metrics;
         _metrics.add_group("slab", {
-            sm::make_derive("malloc_total_operations", sm::description("Total number of slab malloc operations"), _stats.allocs),
-            sm::make_derive("free_total_operations", sm::description("Total number of slab free operations"), _stats.frees),
+            sm::make_counter("malloc_total_operations", sm::description("Total number of slab malloc operations"), _stats.allocs),
+            sm::make_counter("free_total_operations", sm::description("Total number of slab free operations"), _stats.frees),
             sm::make_gauge("malloc_objects", sm::description("Number of slab created objects currently in memory"), [this] {
                 return _stats.allocs - _stats.frees;
             })
@@ -411,8 +411,8 @@ private:
     inline slab_page_desc& get_slab_page_desc(Item *item)
     {
         auto desc = _slab_pages_vector[item->get_slab_page_index()];
-        assert(desc != nullptr);
-        assert(desc->magic() == SLAB_MAGIC_NUMBER);
+        SEASTAR_ASSERT(desc != nullptr);
+        SEASTAR_ASSERT(desc->magic() == SLAB_MAGIC_NUMBER);
         return *desc;
     }
 

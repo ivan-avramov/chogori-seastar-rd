@@ -21,8 +21,14 @@
 
 #pragma once
 
-#include <memory>
+#ifndef SEASTAR_MODULE
 #include <algorithm>
+#include <cassert>
+#include <iterator>
+#include <type_traits>
+#include <seastar/util/assert.hh>
+#include <seastar/util/modules.hh>
+#endif
 
 namespace seastar {
 
@@ -82,6 +88,7 @@ namespace seastar {
 // uses move/copy constructors instead of move/copy assignments, which are
 // less efficient.
 
+SEASTAR_MODULE_EXPORT
 template <typename T, size_t items_per_chunk = 128>
 class chunked_fifo {
     static_assert((items_per_chunk & (items_per_chunk - 1)) == 0,
@@ -97,6 +104,11 @@ class chunked_fifo {
         // begin and end interpreted mod items_per_chunk
         unsigned begin;
         unsigned end;
+
+        // the number of elements in this chunk
+        size_t size() const {
+            return end - begin;
+        }
     };
     // We pop from the chunk at _front_chunk. This chunk is then linked to
     // the following chunks via the "next" link. _back_chunk points to the
@@ -126,26 +138,31 @@ public:
     using const_pointer = const T*;
 
 private:
-    template <typename U>
+    template <bool IsConst>
     class basic_iterator {
         friend class chunked_fifo;
 
     public:
         using iterator_category = std::forward_iterator_tag;
         using difference_type = std::ptrdiff_t;
-        using value_type = U;
-        using pointer = U*;
-        using reference = U&;
+        using value_type = std::conditional_t<IsConst, const T, T>;
+        using pointer = value_type*;
+        using reference = value_type&;
 
-    protected:
-        chunk* _chunk = nullptr;
+    private:
+        using chunk_t = std::conditional_t<IsConst, const chunk, chunk>;
+        chunk_t* _chunk = nullptr;
         size_t _item_index = 0;
 
     protected:
-        inline explicit basic_iterator(chunk* c) noexcept;
-        inline basic_iterator(chunk* c, size_t item_index) noexcept;
+        inline explicit basic_iterator(chunk_t* c) noexcept;
+        inline basic_iterator(chunk_t* c, size_t item_index) noexcept;
 
     public:
+        basic_iterator() noexcept = default;
+        template<bool OtherIsConst, std::enable_if_t<IsConst && !OtherIsConst, int> = 0>
+        inline basic_iterator(const basic_iterator<OtherIsConst>& o) noexcept
+	  :  basic_iterator{o._chunk, o._item_index} {}
         inline bool operator==(const basic_iterator& o) const noexcept;
         inline bool operator!=(const basic_iterator& o) const noexcept;
         inline pointer operator->() const noexcept;
@@ -155,25 +172,17 @@ private:
     };
 
 public:
-    class iterator : public basic_iterator<T> {
-        using basic_iterator<T>::basic_iterator;
-    public:
-        iterator() noexcept = default;
-    };
-    class const_iterator : public basic_iterator<const T> {
-        using basic_iterator<T>::basic_iterator;
-    public:
-        const_iterator() noexcept = default;
-        inline const_iterator(iterator o) noexcept;
-    };
+    using iterator = basic_iterator<false>;
+    using const_iterator = basic_iterator<true>;
 
 public:
     chunked_fifo() noexcept = default;
     chunked_fifo(chunked_fifo&& x) noexcept;
-    chunked_fifo(const chunked_fifo& X) = delete;
+    chunked_fifo(const chunked_fifo&);
     ~chunked_fifo();
-    chunked_fifo& operator=(const chunked_fifo&) = delete;
+    chunked_fifo& operator=(const chunked_fifo&);
     chunked_fifo& operator=(chunked_fifo&&) noexcept;
+    inline bool operator==(const chunked_fifo& rhs) const;
     inline void push_back(const T& data);
     inline void push_back(T&& data);
     T& back() noexcept;
@@ -184,6 +193,10 @@ public:
     inline void pop_front() noexcept;
     inline bool empty() const noexcept;
     inline size_t size() const noexcept;
+    // Pop the first n elements from the fifo. Equivalent to calling pop_front()
+    // n times, though likely to be faster for n greater than 1. The fifo must
+    // contain at least n elements or the behavior is undefined.
+    void pop_front_n(size_t n) noexcept;
     void clear() noexcept;
     // reserve(n) ensures that at least (n - size()) further push() calls can
     // be served without needing new memory allocation.
@@ -211,70 +224,64 @@ private:
 };
 
 template <typename T, size_t items_per_chunk>
-template <typename U>
+template <bool IsConst>
 inline
-chunked_fifo<T, items_per_chunk>::basic_iterator<U>::basic_iterator(chunk* c) noexcept : _chunk(c), _item_index(_chunk ? _chunk->begin : 0) {
+chunked_fifo<T, items_per_chunk>::basic_iterator<IsConst>::basic_iterator(chunk_t* c) noexcept : _chunk(c), _item_index(_chunk ? _chunk->begin : 0) {
 }
 
 template <typename T, size_t items_per_chunk>
-template <typename U>
+template <bool IsConst>
 inline
-chunked_fifo<T, items_per_chunk>::basic_iterator<U>::basic_iterator(chunk* c, size_t item_index) noexcept : _chunk(c), _item_index(item_index) {
+chunked_fifo<T, items_per_chunk>::basic_iterator<IsConst>::basic_iterator(chunk_t* c, size_t item_index) noexcept : _chunk(c), _item_index(item_index) {
 }
 
 template <typename T, size_t items_per_chunk>
-template <typename U>
+template <bool IsConst>
 inline bool
-chunked_fifo<T, items_per_chunk>::basic_iterator<U>::operator==(const basic_iterator& o) const noexcept {
+chunked_fifo<T, items_per_chunk>::basic_iterator<IsConst>::operator==(const basic_iterator& o) const noexcept {
     return _chunk == o._chunk && _item_index == o._item_index;
 }
 
 template <typename T, size_t items_per_chunk>
-template <typename U>
+template <bool IsConst>
 inline bool
-chunked_fifo<T, items_per_chunk>::basic_iterator<U>::operator!=(const basic_iterator& o) const noexcept {
+chunked_fifo<T, items_per_chunk>::basic_iterator<IsConst>::operator!=(const basic_iterator& o) const noexcept {
     return !(*this == o);
 }
 
 template <typename T, size_t items_per_chunk>
-template <typename U>
-inline typename chunked_fifo<T, items_per_chunk>::template basic_iterator<U>::pointer
-chunked_fifo<T, items_per_chunk>::basic_iterator<U>::operator->() const noexcept {
+template <bool IsConst>
+inline typename chunked_fifo<T, items_per_chunk>::template basic_iterator<IsConst>::pointer
+chunked_fifo<T, items_per_chunk>::basic_iterator<IsConst>::operator->() const noexcept {
     return &_chunk->items[chunked_fifo::mask(_item_index)].data;
 }
 
 template <typename T, size_t items_per_chunk>
-template <typename U>
-inline typename chunked_fifo<T, items_per_chunk>::template basic_iterator<U>::reference
-chunked_fifo<T, items_per_chunk>::basic_iterator<U>::operator*() const noexcept {
+template <bool IsConst>
+inline typename chunked_fifo<T, items_per_chunk>::template basic_iterator<IsConst>::reference
+chunked_fifo<T, items_per_chunk>::basic_iterator<IsConst>::operator*() const noexcept {
     return _chunk->items[chunked_fifo::mask(_item_index)].data;
 }
 
 template <typename T, size_t items_per_chunk>
-template <typename U>
-inline typename chunked_fifo<T, items_per_chunk>::template basic_iterator<U>
-chunked_fifo<T, items_per_chunk>::basic_iterator<U>::operator++(int) noexcept {
+template <bool IsConst>
+inline typename chunked_fifo<T, items_per_chunk>::template basic_iterator<IsConst>
+chunked_fifo<T, items_per_chunk>::basic_iterator<IsConst>::operator++(int) noexcept {
     auto it = *this;
     ++(*this);
     return it;
 }
 
 template <typename T, size_t items_per_chunk>
-template <typename U>
-typename chunked_fifo<T, items_per_chunk>::template basic_iterator<U>&
-chunked_fifo<T, items_per_chunk>::basic_iterator<U>::operator++() noexcept {
+template <bool IsConst>
+typename chunked_fifo<T, items_per_chunk>::template basic_iterator<IsConst>&
+chunked_fifo<T, items_per_chunk>::basic_iterator<IsConst>::operator++() noexcept {
     ++_item_index;
     if (_item_index == _chunk->end) {
         _chunk = _chunk->next;
         _item_index = _chunk ? _chunk->begin : 0;
     }
     return *this;
-}
-
-template <typename T, size_t items_per_chunk>
-inline
-chunked_fifo<T, items_per_chunk>::const_iterator::const_iterator(chunked_fifo<T, items_per_chunk>::iterator o) noexcept
-    : basic_iterator<const T>(o._chunk, o._item_index) {
 }
 
 template <typename T, size_t items_per_chunk>
@@ -290,6 +297,25 @@ chunked_fifo<T, items_per_chunk>::chunked_fifo(chunked_fifo&& x) noexcept
     x._nchunks = 0;
     x._free_chunks = nullptr;
     x._nfree_chunks = 0;
+}
+
+template <typename T, size_t items_per_chunk>
+inline
+chunked_fifo<T, items_per_chunk>::chunked_fifo(const chunked_fifo& rhs)
+        : chunked_fifo() {
+    std::copy_n(rhs.begin(), rhs.size(), std::back_inserter(*this));
+}
+
+template <typename T, size_t items_per_chunk>
+inline
+chunked_fifo<T, items_per_chunk>&
+chunked_fifo<T, items_per_chunk>::operator=(const chunked_fifo& rhs) {
+    if (&rhs != this) {
+        clear();
+        std::copy_n(rhs.begin(), rhs.size(), std::back_inserter(*this));
+        shrink_to_fit();
+    }
+    return *this;
 }
 
 template <typename T, size_t items_per_chunk>
@@ -332,48 +358,31 @@ chunked_fifo<T, items_per_chunk>::size() const noexcept{
 
 template <typename T, size_t items_per_chunk>
 void chunked_fifo<T, items_per_chunk>::clear() noexcept {
-#if 1
-    while (!empty()) {
-        pop_front();
-    }
-#else
-    // This is specialized code to free the contents of all the chunks and the
-    // chunks themselves. but since destroying a very full queue is not an
-    // important use case to optimize, the simple loop above is preferable.
-    if (!_front_chunk) {
-        // Empty, nothing to do
-        return;
-    }
-    // Delete front chunk (partially filled)
-    for (auto i = _front_chunk->begin; i != _front_chunk->end; ++i) {
-        _front_chunk->items[mask(i)].data.~T();
-    }
-    chunk *p = _front_chunk->next;
-    delete _front_chunk;
-    // Delete all the middle chunks (all completely filled)
-    if (p) {
-        while (p != _back_chunk) {
-            // These are full chunks
-            chunk *nextp = p->next;
-            for (auto i = 0; i != items_per_chunk; ++i) {
-                // Note we delete out of order (we don't start with p->begin).
-                // That should be fine..
-                p->items[i].data.~T();
-        }
-            delete p;
-            p = nextp;
-        }
-        // Finally delete back chunk (partially filled)
-        for (auto i = _back_chunk->begin; i != _back_chunk->end; ++i) {
-            _back_chunk->items[mask(i)].data.~T();
-        }
-        delete _back_chunk;
-    }
-    _front_chunk = nullptr;
-    _back_chunk = nullptr;
-    _nchunks = 0;
-#endif
+    pop_front_n(size());
 }
+
+template <typename T, size_t items_per_chunk>
+void chunked_fifo<T, items_per_chunk>::pop_front_n(size_t n) noexcept {
+    while (n) {
+        SEASTAR_ASSERT(_front_chunk && "pop_front_n n too large");
+
+        auto target = _front_chunk;
+        unsigned delete_count = std::min(target->size(), n);
+
+        for (auto i = target->begin, e = i + delete_count; i != e; i++) {
+            target->items[mask(i)].data.~T();
+        }
+
+        target->begin += delete_count;
+        n -= delete_count;
+
+        if (target->size() == 0) {
+            front_chunk_delete();
+        }
+    }
+}
+
+
 
 template <typename T, size_t items_per_chunk> void
 chunked_fifo<T, items_per_chunk>::shrink_to_fit() noexcept {
@@ -466,6 +475,11 @@ chunked_fifo<T, items_per_chunk>::emplace_back(Args&&... args) {
         throw;
     }
     ++_back_chunk->end;
+}
+
+template <typename T, size_t items_per_chunk>
+inline bool chunked_fifo<T, items_per_chunk>::operator==(const chunked_fifo& rhs) const {
+    return size() == rhs.size() && std::equal(begin(), end(), rhs.begin());
 }
 
 template <typename T, size_t items_per_chunk>

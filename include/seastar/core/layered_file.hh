@@ -21,7 +21,10 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <seastar/core/file.hh>
+#include <seastar/util/modules.hh>
+#endif
 
 namespace seastar {
 
@@ -36,6 +39,7 @@ namespace seastar {
 /// of layered files by performing standard tasks such as setting up the
 /// file alignment. Actual implementation of the I/O methods is left for the
 /// derived class.
+SEASTAR_MODULE_EXPORT
 class layered_file_impl : public file_impl {
 protected:
     file _underlying_file;
@@ -47,6 +51,7 @@ public:
         _memory_dma_alignment = _underlying_file.memory_dma_alignment();
         _disk_read_dma_alignment = _underlying_file.disk_read_dma_alignment();
         _disk_write_dma_alignment = _underlying_file.disk_write_dma_alignment();
+        _disk_overwrite_dma_alignment = _underlying_file.disk_overwrite_dma_alignment();
     }
 
     /// The underlying file which can be used to back I/O methods.

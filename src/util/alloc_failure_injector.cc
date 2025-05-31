@@ -19,10 +19,18 @@
  * Copyright 2017 ScyllaDB
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#include <cstdint>
+#include <new>
+#include <utility>
+module seastar;
+#else
 #include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/defer.hh>
+#endif
 
 namespace seastar {
 namespace memory {
@@ -41,7 +49,7 @@ void alloc_failure_injector::fail() {
 }
 
 void alloc_failure_injector::run_with_callback(noncopyable_function<void()> callback, noncopyable_function<void()> to_run) {
-    auto restore = defer([this, prev = std::exchange(_on_alloc_failure, std::move(callback))] () mutable {
+    auto restore = defer([this, prev = std::exchange(_on_alloc_failure, std::move(callback))] () mutable noexcept {
         _on_alloc_failure = std::move(prev);
     });
     to_run();

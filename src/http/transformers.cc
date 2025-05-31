@@ -19,11 +19,21 @@
  * Copyright 2015 Cloudius Systems
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <boost/algorithm/string/replace.hpp>
+#include <list>
+#include <memory>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/core/do_with.hh>
 #include <seastar/core/loop.hh>
-#include <boost/algorithm/string/replace.hpp>
 #include <seastar/http/transformers.hh>
-#include <list>
+#endif
 
 namespace seastar {
 
@@ -198,14 +208,16 @@ public:
                 std::move(out), std::move(key_value))) {}
 };
 
-output_stream<char> content_replace::transform(std::unique_ptr<request> req,
+output_stream<char> content_replace::transform(std::unique_ptr<http::request> req,
             const sstring& extension, output_stream<char>&& s) {
     sstring host = req->get_header("Host");
     if (host == "" || (this->extension != "" && extension != this->extension)) {
         return std::move(s);
     }
     sstring protocol = req->get_protocol_name();
-    return output_stream<char>(content_replace_data_sink(std::move(s), {std::make_tuple("Protocol", protocol), std::make_tuple("Host", host)}), 32000, true);
+    output_stream_options opts;
+    opts.trim_to_size = true;
+    return output_stream<char>(content_replace_data_sink(std::move(s), {std::make_tuple("Protocol", protocol), std::make_tuple("Host", host)}), 32000, opts);
 
 }
 

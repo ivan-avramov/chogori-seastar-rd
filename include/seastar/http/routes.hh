@@ -21,18 +21,22 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
+#include <boost/program_options/variables_map.hpp>
+#include <unordered_map>
+#endif
+
 #include <seastar/http/matchrules.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/common.hh>
 #include <seastar/http/reply.hh>
-
-#include <boost/program_options/variables_map.hpp>
-#include <unordered_map>
+#include <seastar/util/modules.hh>
 
 namespace seastar {
 
 namespace httpd {
 
+SEASTAR_MODULE_EXPORT_BEGIN
 /**
  * The url helps defining a route.
  */
@@ -70,7 +74,7 @@ struct path_description;
 /**
  * routes object do the request dispatching according to the url.
  * It uses two decision mechanism exact match, if a url matches exactly
- * (an optional leading slash is permitted) it is choosen
+ * (an optional leading slash is permitted) it is chosen
  * If not, the matching rules are used.
  * matching rules are evaluated by their insertion order
  */
@@ -85,7 +89,11 @@ public:
      * adding a handler as an exact match
      * @param url the url to match (note that url should start with /)
      * @param handler the desire handler
-     * @return it self
+     * @return itself
+     * @attention If successful, this method takes ownership of the handler
+        pointer. It will be automatically deleted when the routes instance is
+        destroyed. However, if the method throws, the caller is responsible
+        for deleting the handler pointer.
      */
     routes& put(operation_type type, const sstring& url, handler_base* handler);
 
@@ -103,7 +111,9 @@ public:
      * First in higher priority
      * @param rule a rule to add
      * @param type the operation type
-     * @return it self
+     * @return itself
+     * @attention This method takes ownership of the match_rule pointer. It will be automatically deleted when the
+     * routes instance is destroyed.
      */
     routes& add(match_rule* rule, operation_type type = GET) {
         _rules[type][_rover++] = rule;
@@ -117,6 +127,8 @@ public:
      * @param url
      * @param handler
      * @return
+     * @attention This method takes ownership of the handler's pointer.It will be automatically deleted when the routes
+     * instance is destroyed.
      */
     routes& add(operation_type type, const url& url, handler_base* handler);
 
@@ -125,6 +137,7 @@ public:
      * Example  routes.add_default_handler(handler);
      * @param handler
      * @return
+     * @attention The caller must keep the @c handler active as long as the route instance is active.
      */
     routes& add_default_handler(handler_base* handler);
 
@@ -133,12 +146,12 @@ public:
      * the general handler calls this method with the request
      * the method takes the headers from the request and find the
      * right handler.
-     * It then call the handler with the parameters (if they exists) found in the url
+     * It then calls the handler with the parameters (if they exist) found in the url
      * @param path the url path found
      * @param req the http request
      * @param rep the http reply
      */
-    future<std::unique_ptr<reply> > handle(const sstring& path, std::unique_ptr<request> req, std::unique_ptr<reply> rep);
+    future<std::unique_ptr<http::reply> > handle(const sstring& path, std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep);
 
     /**
      * Search and return an exact match
@@ -165,7 +178,6 @@ private:
      * Normalize the url to remove the last / if exists
      * and get the parameter part
      * @param url the full url path
-     * @param param_part will hold the string with the parameters
      * @return the url from the request without the last /
      */
     sstring normalize_url(const sstring& url);
@@ -179,7 +191,7 @@ private:
     //default Handler -- for any HTTP Method and Path (/*)
     handler_base* _default_handler = nullptr;
 public:
-    using exception_handler_fun = std::function<std::unique_ptr<reply>(std::exception_ptr eptr)>;
+    using exception_handler_fun = std::function<std::unique_ptr<http::reply>(std::exception_ptr eptr)>;
     using exception_handler_id = size_t;
 private:
     std::map<exception_handler_id, exception_handler_fun> _exceptions;
@@ -204,7 +216,7 @@ public:
         _exceptions.erase(id);
     }
 
-    std::unique_ptr<reply> exception_reply(std::exception_ptr eptr);
+    std::unique_ptr<http::reply> exception_reply(std::exception_ptr eptr);
 
     routes();
 
@@ -221,6 +233,8 @@ public:
      * @param rule a rule to add
      * @param type the operation type
      * @return a cookie using which the rule can be removed
+     * @attention This method takes ownership of the match_rule pointer. It will be automatically deleted when the
+     * routes instance is destroyed.
      */
     rule_cookie add_cookie(match_rule* rule, operation_type type) {
         auto pos = _rover++;
@@ -233,17 +247,10 @@ public:
      * @param cookie a cookie returned previously by add_cookie
      * @param type the operation type
      * @return the pointer to the rule
+     * @attention Ownership of the pointer is returned to the caller.
      */
     match_rule* del_cookie(rule_cookie cookie, operation_type type);
 };
-
-/**
- * A helper function that check if a parameter is found in the params object
- * if it does not the function would throw a parameter not found exception
- * @param params the parameters object
- * @param param the parameter to look for
- */
-void verify_param(const httpd::request& req, const sstring& param);
 
 /**
  * The handler_registration object facilitates registration and auto
@@ -294,6 +301,7 @@ public:
     ~rule_registration();
 };
 
+SEASTAR_MODULE_EXPORT_END
 }
 
 }

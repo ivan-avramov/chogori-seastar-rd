@@ -1,3 +1,8 @@
+// If _FORTIFY_SOURCE is defined then longjmp ends up using longjmp_chk
+// which asserts that you're jumping to the same stack. However, here we
+// are intentionally switching stacks when longjmp'ing, so undefine this
+// option to always use normal longjmp.
+#undef _FORTIFY_SOURCE
 /*
  * This file is open source software, licensed to you under the terms
  * of the Apache License, Version 2.0 (the "License").  See the NOTICE file
@@ -19,14 +24,28 @@
 /*
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
+#ifdef SEASTAR_MODULE
+module;
+#endif
 
+#include <ucontext.h>
+#ifndef SEASTAR_ASAN_ENABLED
+#include <setjmp.h>
+#endif
+#include <stdint.h>
+#include <valgrind/valgrind.h>
+#include <exception>
+#include <utility>
+#include <boost/intrusive/list.hpp>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/core/thread.hh>
 #include <seastar/core/posix.hh>
 #include <seastar/core/reactor.hh>
-#include <ucontext.h>
-#include <algorithm>
-
-#include <valgrind/valgrind.h>
+#include <seastar/util/assert.hh>
+#endif
 
 /// \cond internal
 
@@ -178,7 +197,7 @@ thread_context::thread_context(thread_attributes attr, noncopyable_function<void
 thread_context::~thread_context() {
 #ifdef SEASTAR_THREAD_STACK_GUARDS
     auto mp_result = mprotect(_stack.get(), getpagesize(), PROT_READ | PROT_WRITE);
-    assert(mp_result == 0);
+    SEASTAR_ASSERT(mp_result == 0);
 #endif
     _all_threads.erase(_all_threads.iterator_to(*this));
 }
@@ -201,7 +220,7 @@ thread_context::make_stack(size_t stack_size) {
     auto stack = stack_holder(new (mem) char[stack_size], stack_deleter(valgrind_id));
 #ifdef SEASTAR_ASAN_ENABLED
     // Avoid ASAN false positive due to garbage on stack
-    std::fill_n(stack.get(), stack_size, 0);
+    std::memset(stack.get(), 0, stack_size);
 #endif
 
 #ifdef SEASTAR_THREAD_STACK_GUARDS
@@ -286,6 +305,8 @@ thread_context::main() {
     asm(".cfi_undefined lr");
 #elif defined(__aarch64__)
     asm(".cfi_undefined x30");
+#elif defined(__s390x__)
+    asm(".cfi_undefined %r14");
 #else
     #warning "Backtracing from seastar threads may be broken"
 #endif
@@ -332,17 +353,6 @@ sched_group(const thread_context* thread) {
 
 void thread::yield() {
     thread_impl::get()->yield();
-}
-
-bool thread::should_yield() {
-    return thread_impl::get()->should_yield();
-}
-
-void thread::maybe_yield() {
-    auto tctx = thread_impl::get();
-    if (tctx->should_yield()) {
-        tctx->yield();
-    }
 }
 
 }

@@ -29,16 +29,20 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/test_runner.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/print.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/tmp_file.hh>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include "mock_file.hh"
 #include <boost/range/irange.hpp>
+#include <seastar/util/closeable.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 
 using namespace seastar;
 namespace fs = std::filesystem;
@@ -46,7 +50,7 @@ namespace fs = std::filesystem;
 struct writer {
     output_stream<char> out;
     static future<shared_ptr<writer>> make(file f) {
-        return api_v3::and_newer::make_file_output_stream(std::move(f)).then([] (output_stream<char>&& os) {
+        return make_file_output_stream(std::move(f)).then([] (output_stream<char>&& os) {
             return make_shared<writer>(writer{std::move(os)});
         });
     }
@@ -115,8 +119,8 @@ SEASTAR_TEST_CASE(test_consume_skip_bytes) {
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         auto filename = (t.get_path() / "testfile.tmp").native();
         auto f = open_file_dma(filename,
-                               open_flags::rw | open_flags::create | open_flags::truncate).get0();
-        auto w = writer::make(std::move(f)).get0();
+                               open_flags::rw | open_flags::create | open_flags::truncate).get();
+        auto w = writer::make(std::move(f)).get();
         auto write_block = [w] (char c, size_t size) {
             std::vector<char> vec(size, c);
             w->out.write(&vec.front(), vec.size()).get();
@@ -131,8 +135,9 @@ SEASTAR_TEST_CASE(test_consume_skip_bytes) {
          * *
          * 00004000
          */
-        f = open_file_dma(filename, open_flags::ro).get0();
+        f = open_file_dma(filename, open_flags::ro).get();
         auto r = make_lw_shared<reader>(std::move(f), file_input_stream_options{512});
+        auto close_r_in = deferred_close(r->in);
         struct consumer {
             uint64_t _count = 0;
             using consumption_result_type = typename input_stream<char>::consumption_result_type;
@@ -157,7 +162,7 @@ SEASTAR_TEST_CASE(test_consume_skip_bytes) {
                     if (_count == 8000) {
                         return make_ready_future<consumption_result_type>(skip_bytes{2000 - buf.size()});
                     } else {
-                        assert(buf.empty());
+                        SEASTAR_ASSERT(buf.empty());
                         return make_ready_future<consumption_result_type>(continue_consuming{});
                     }
                     return make_ready_future<consumption_result_type>(continue_consuming{});
@@ -176,7 +181,6 @@ SEASTAR_TEST_CASE(test_consume_skip_bytes) {
             }
         };
         r->in.consume(consumer{}).get();
-        r->in.close().get();
     });
 }
 
@@ -226,7 +230,7 @@ future<> test_consume_until_end(uint64_t size) {
     auto filename = (t.get_path() / "testfile.tmp").native();
     return open_file_dma(filename,
             open_flags::rw | open_flags::create | open_flags::truncate).then([size] (file f) {
-          return api_v3::and_newer::make_file_output_stream(f).then([size] (output_stream<char>&& os) {
+          return make_file_output_stream(f).then([size] (output_stream<char>&& os) {
             return do_with(std::move(os), [size] (output_stream<char>& out) {
                 std::vector<char> buf(size);
                 std::iota(buf.begin(), buf.end(), 0);
@@ -282,15 +286,16 @@ SEASTAR_TEST_CASE(test_consume_unaligned_file_large) {
 SEASTAR_TEST_CASE(test_input_stream_esp_around_eof) {
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         auto flen = uint64_t(5341);
-        auto rdist = std::uniform_int_distribution<char>();
+        auto rdist = std::uniform_int_distribution<int>(0, std::numeric_limits<char>::max());
         auto reng = testing::local_random_engine;
         auto data = boost::copy_range<std::vector<uint8_t>>(
                 boost::irange<uint64_t>(0, flen)
                 | boost::adaptors::transformed([&] (int x) { return rdist(reng); }));
         auto filename = (t.get_path() / "testfile.tmp").native();
         auto f = open_file_dma(filename,
-                open_flags::rw | open_flags::create | open_flags::truncate).get0();
-        auto out = api_v3::and_newer::make_file_output_stream(f).get0();
+                open_flags::rw | open_flags::create | open_flags::truncate).get();
+        auto close_f = deferred_close(f);
+        auto out = make_file_output_stream(f).get();
         out.write(reinterpret_cast<const char*>(data.data()), data.size()).get();
         out.flush().get();
         //out.close().get();  // FIXME: closes underlying stream:?!
@@ -325,7 +330,7 @@ SEASTAR_TEST_CASE(test_input_stream_esp_around_eof) {
             std::vector<uint8_t> readback;
             auto more = true;
             while (more) {
-                auto rdata = in.read().get0();
+                auto rdata = in.read().get();
                 for (size_t i = 0; i < rdata.size(); ++i) {
                     readback.push_back(rdata.get()[i]);
                 }
@@ -338,28 +343,26 @@ SEASTAR_TEST_CASE(test_input_stream_esp_around_eof) {
             }
             BOOST_REQUIRE(std::equal(readback.begin(), readback.end(), data.begin() + std::min(start, flen)));
         }
-        f.close().get();
     });
 }
 
-#if SEASTAR_API_LEVEL >= 3
 SEASTAR_TEST_CASE(without_api_prefix) {
     return tmp_dir::do_with_thread([](tmp_dir& t) {
         auto filename = (t.get_path() / "testfile.tmp").native();
         auto f = open_file_dma(filename,
-                open_flags::rw | open_flags::create | open_flags::truncate).get0();
-        output_stream<char> out = make_file_output_stream(f).get0();
+                open_flags::rw | open_flags::create | open_flags::truncate).get();
+        output_stream<char> out = make_file_output_stream(f).get();
         out.close().get();
     });
 }
-#endif
 
 SEASTAR_TEST_CASE(file_handle_test) {
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         auto filename = (t.get_path() / "testfile.tmp").native();
-        auto f = open_file_dma(filename, open_flags::create | open_flags::truncate | open_flags::rw).get0();
+        auto f = open_file_dma(filename, open_flags::create | open_flags::truncate | open_flags::rw).get();
+        auto close_f = deferred_close(f);
         auto buf = static_cast<char*>(aligned_alloc(4096, 4096));
-        auto del = defer([&] { ::free(buf); });
+        auto del = defer([&] () noexcept { ::free(buf); });
         for (unsigned i = 0; i < 4096; ++i) {
             buf[i] = i;
         }
@@ -369,7 +372,7 @@ SEASTAR_TEST_CASE(file_handle_test) {
             return seastar::async([fh, &bad] {
                 auto f = fh.to_file();
                 auto buf = static_cast<char*>(aligned_alloc(4096, 4096));
-                auto del = defer([&] { ::free(buf); });
+                auto del = defer([&] () noexcept { ::free(buf); });
                 f.dma_read(0, buf, 4096).get();
                 for (unsigned i = 0; i < 4096; ++i) {
                     bad[this_shard_id()] |= buf[i] != char(i);
@@ -377,7 +380,6 @@ SEASTAR_TEST_CASE(file_handle_test) {
             });
         }).get();
         BOOST_REQUIRE(!boost::algorithm::any_of_equal(bad, 1u));
-        f.close().get();
     });
 }
 
@@ -423,7 +425,7 @@ SEASTAR_TEST_CASE(test_fstream_slow_start) {
                 BOOST_CHECK_LT(total_read, file_size);
 
                 mock_file->set_allowed_read_requests(requests_at_slow_start);
-                auto buf = fstr.read().get0();
+                auto buf = fstr.read().get();
                 BOOST_CHECK_GT(buf.size(), 0u);
 
                 mock_file->set_read_size_verifier([&] (size_t length) {
@@ -445,14 +447,14 @@ SEASTAR_TEST_CASE(test_fstream_slow_start) {
             mock_file->set_expected_read_size(buffer_size);
             while (total_read != file_size) {
                 mock_file->set_allowed_read_requests(requests_at_full_speed);
-                auto buf = fstr.read().get0();
+                auto buf = fstr.read().get();
                 total_read += buf.size();
             }
 
             mock_file->set_allowed_read_requests(requests_at_full_speed);
-            auto buf = fstr.read().get0();
+            auto buf = fstr.read().get();
             BOOST_CHECK_EQUAL(buf.size(), 0u);
-            assert(buf.size() == 0);
+            SEASTAR_ASSERT(buf.size() == 0);
         };
 
         auto read_while_file_at_full_speed = [&] (auto fstr) {
@@ -461,12 +463,12 @@ SEASTAR_TEST_CASE(test_fstream_slow_start) {
             mock_file->set_expected_read_size(buffer_size);
             while (total_read != file_size) {
                 mock_file->set_allowed_read_requests(requests_at_full_speed);
-                auto buf = fstr.read().get0();
+                auto buf = fstr.read().get();
                 total_read += buf.size();
             }
 
             mock_file->set_allowed_read_requests(requests_at_full_speed);
-            auto buf = fstr.read().get0();
+            auto buf = fstr.read().get();
             BOOST_CHECK_EQUAL(buf.size(), 0u);
         };
 
@@ -482,10 +484,10 @@ SEASTAR_TEST_CASE(test_fstream_slow_start) {
                 previous_buffer_size = length;
             });
             while (total_read != file_size) {
-                auto buf = fstr.read().get0();
+                auto buf = fstr.read().get();
                 total_read += buf.size();
 
-                buf = fstr.read().get0();
+                buf = fstr.read().get();
                 total_read += buf.size();
 
                 auto skip_by = std::min(file_size - total_read, buffer_size * 2);
@@ -500,7 +502,7 @@ SEASTAR_TEST_CASE(test_fstream_slow_start) {
             }
 
             mock_file->set_allowed_read_requests(requests_at_full_speed);
-            auto buf = fstr.read().get0();
+            auto buf = fstr.read().get();
             BOOST_CHECK_EQUAL(buf.size(), 0u);
 
         };
@@ -536,3 +538,43 @@ SEASTAR_TEST_CASE(test_fstream_slow_start) {
         read_while_file_at_full_speed(make_fstream());
     });
 }
+
+#ifdef SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION
+
+SEASTAR_TEST_CASE(test_close_error) {
+    using namespace seastar::memory;
+
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        bool done = false;
+        for (size_t i = 0; !done; i++) {
+            bool got_close_error = false;
+            sstring filename = (t.get_path() / format("testfile-{}.tmp", i).c_str()).native();
+            file f = open_file_dma(filename, open_flags::rw | open_flags::create | open_flags::truncate).get();
+            auto opts = file_output_stream_options{};
+            opts.write_behind = 16;
+            std::unique_ptr<output_stream<char>> out = std::make_unique<output_stream<char>>(make_file_output_stream(std::move(f), opts).get());
+            size_t size = 4096;
+            std::vector<char> buf(size);
+            std::iota(buf.begin(), buf.end(), 0);
+            size_t file_length = 1 * 1024 * 1024;
+            auto fut = make_ready_future<>();
+            for (size_t len = 0; len < file_length; len += size) {
+                fut = fut.finally([&] { return out->write(buf.data(), size); });
+            }
+            fut.get();
+            try {
+                local_failure_injector().fail_after(i);
+                out->close().get();
+                done = true;
+                local_failure_injector().cancel();
+            } catch (const std::bad_alloc&) {
+                got_close_error = true;
+            }
+            BOOST_REQUIRE(got_close_error || done);
+            out.reset();
+            remove_file(filename).get();
+        }
+    });
+}
+
+#endif // SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION

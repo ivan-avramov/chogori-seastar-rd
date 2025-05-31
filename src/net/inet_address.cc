@@ -19,15 +19,26 @@
  * Copyright (C) 2016 ScyllaDB.
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <algorithm>
 #include <ostream>
 #include <arpa/inet.h>
 #include <boost/functional/hash.hpp>
+#include <fmt/ostream.h>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/dns.hh>
 #include <seastar/net/ip.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/print.hh>
+#endif
 
 static_assert(std::is_nothrow_default_constructible_v<seastar::net::ipv4_address>);
 static_assert(std::is_nothrow_copy_constructible_v<seastar::net::ipv4_address>);
@@ -59,7 +70,7 @@ seastar::net::inet_address::inet_address(::in6_addr i, uint32_t scope) noexcept
                 : _in_family(family::INET6), _in6(i), _scope(scope) {
 }
 
-std::optional<seastar::net::inet_address> 
+std::optional<seastar::net::inet_address>
 seastar::net::inet_address::parse_numerical(const sstring& addr) {
     inet_address in;
     if (::inet_pton(AF_INET, addr.c_str(), &in._in)) {
@@ -96,7 +107,7 @@ seastar::net::inet_address::parse_numerical(const sstring& addr) {
 
 seastar::net::inet_address::inet_address(const sstring& addr)
                 : inet_address([&addr] {
-    auto res = parse_numerical(addr);                        
+    auto res = parse_numerical(addr);
     if (res) {
         return std::move(*res);
     }
@@ -155,7 +166,7 @@ seastar::net::inet_address::operator ::in_addr() const {
 seastar::net::inet_address::operator ::in6_addr() const noexcept {
     if (_in_family == family::INET) {
         in6_addr in6 = IN6ADDR_ANY_INIT;
-        in6.s6_addr32[2] = ::htonl(0xffff);
+        in6.s6_addr32[2] = htonl(0xffff);
         in6.s6_addr32[3] = _in.s_addr;
         return in6;
     }
@@ -181,6 +192,28 @@ const void * seastar::net::inet_address::data() const noexcept {
     return &_in;
 }
 
+bool seastar::net::inet_address::is_loopback() const noexcept {
+    switch (_in_family) {
+    case family::INET:
+        return (net::ntoh(_in.s_addr) & 0xff000000) == 0x7f000000;
+    case family::INET6:
+        return std::equal(std::begin(_in6.s6_addr), std::end(_in6.s6_addr), std::begin(::in6addr_loopback.s6_addr));
+    default:
+        return false;
+    }
+}
+
+bool seastar::net::inet_address::is_addr_any() const noexcept {
+    switch (_in_family) {
+    case family::INET:
+        return _in.s_addr == INADDR_ANY;
+    case family::INET6:
+        return std::equal(std::begin(_in6.s6_addr), std::end(_in6.s6_addr), std::begin(::in6addr_any.s6_addr));
+    default:
+        return false;
+    }
+}
+
 seastar::net::ipv6_address::ipv6_address(const ::in6_addr& in) noexcept {
     std::copy(std::begin(in.s6_addr), std::end(in.s6_addr), ip.begin());
 }
@@ -199,7 +232,7 @@ seastar::net::ipv6_address::ipv6_address() noexcept
 
 seastar::net::ipv6_address::ipv6_address(const std::string& addr) {
     if (!::inet_pton(AF_INET6, addr.c_str(), ip.data())) {
-        throw std::runtime_error(format("Wrong format for IPv6 address {}. Please ensure it's in colon-hex format",
+        throw std::runtime_error(fmt::format("Wrong format for IPv6 address {}. Please ensure it's in colon-hex format",
                                         addr));
     }
 }
@@ -232,11 +265,12 @@ bool seastar::net::ipv6_address::is_unspecified() const noexcept {
 
 std::ostream& seastar::net::operator<<(std::ostream& os, const ipv4_address& a) {
     auto ip = a.ip;
-    return fmt_print(os, "{:d}.{:d}.{:d}.{:d}",
+    fmt::print(os, "{:d}.{:d}.{:d}.{:d}",
             (ip >> 24) & 0xff,
             (ip >> 16) & 0xff,
             (ip >> 8) & 0xff,
             (ip >> 0) & 0xff);
+    return os;
 }
 
 std::ostream& seastar::net::operator<<(std::ostream& os, const ipv6_address& a) {

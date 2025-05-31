@@ -20,81 +20,106 @@
 # Copyright (C) 2019 Scylladb, Ltd.
 #
 
-#
-# CMake bundles `FindBoost.cmake`, which is coupled to the Boost version. If
-# we're on a system without a recent enough version of `FindBoost.cmake`, then
-# we need to use the one bundled with Seastar.
-#
-# The "real" FIND_PACKAGE invocation for Boost is inside SEASTAR_FIND_DEPENDENCIES.
-#
+include(CMakeParseArguments)
 
-# Be consistent in results from FindBoost.cmake.
 # This is required because cmake-boost may return to Boost_{component}_LIBRARY:
 # - /usr/lib64/libboost_foo.so
 # - Boost::foo
+# While pkgconf's .pc file consumers expect argument which can be passed as
+# part of the command line arguments
 set (Boost_NO_BOOST_CMAKE ON)
 
-# This is the minimum version of Boost we need the CMake-bundled `FindBoost.cmake` to know about.
-find_package (Boost 1.64 MODULE)
+# for including the fix of https://github.com/boostorg/test/pull/252
+set (_seastar_boost_version 1.73.0)
 
-#
-# Iterate through the dependency list defined below and execute `find_package`
-# with the corresponding configuration for each 3rd-party dependency.
-#
+# This is the minimum version of Boost we need the CMake-bundled `FindBoost.cmake` to know about.
+find_package (Boost ${_seastar_boost_version})
+if (Boost_VERSION_STRING VERSION_LESS 1.81.0)
+  set_target_properties (Boost::boost PROPERTIES
+    INTERFACE_COMPILE_DEFINITIONS "BOOST_NO_CXX98_FUNCTION_BASE")
+endif ()
+
+if (CMAKE_FIND_PACKAGE_NAME)
+  # used inside find_package(Seastar)
+  include (CMakeFindDependencyMacro)
+
+  macro (seastar_find_dep package)
+    cmake_parse_arguments(args "REQUIRED" "" "" ${ARGN})
+    if (arg_REQUIRED)
+      find_dependency (${package} ${arg_UNPARSED_ARGUMENTS})
+    else ()
+      # some packages are not REQUIRED, so we just check for them instead of
+      # populating "REQUIRED" from the original find_package() call.
+      find_package (${package} ${ARGN})
+    endif ()
+  endmacro ()
+else()
+  macro (seastar_find_dep package)
+    # used when configuring Seastar
+    find_package (${package} ${ARGN})
+  endmacro ()
+endif ()
+
 macro (seastar_find_dependencies)
   #
   # List of Seastar dependencies that is meant to be used
   # both in Seastar configuration and by clients which
   # consume Seastar via SeastarConfig.cmake.
   #
-  set (_seastar_all_dependencies
-    # Public dependencies.
-    Boost
-    c-ares
-    cryptopp
-    dpdk # No version information published.
-    fmt
-    lz4
-    # Private and private/public dependencies.
-    Concepts
-    GnuTLS
-    LinuxMembarrier
-    Protobuf
-    Sanitizers
-    StdAtomic
-    hwloc
-    lksctp-tools # No version information published.
-    numactl # No version information published.
-    rt
-    yaml-cpp)
-
-  # Arguments to `find_package` for each 3rd-party dependency.
-  # Note that the version specification is a "minimal" version requirement.
-
   # `unit_test_framework` is not required in the case we are building Seastar
   # without the testing library, however the component is always specified as required
   # to keep the CMake code minimalistic and easy-to-use.
-  set (_seastar_dep_args_Boost
-    1.64.0
+  seastar_find_dep (Boost ${_seastar_boost_version} REQUIRED
     COMPONENTS
+      filesystem
       program_options
       thread
-      unit_test_framework
-    REQUIRED)
+      unit_test_framework)
+  seastar_find_dep (c-ares 1.13 REQUIRED)
+  if (c-ares_VERSION VERSION_GREATER_EQUAL 1.33.0 AND c-ares_VERSION VERSION_LESS 1.34.1)
+    # https://github.com/scylladb/seastar/issues/2472
+    message (FATAL_ERROR
+      "c-ares ${c-ares_VERSION} is not supported. "
+      "Seastar requires c-ares version <1.33 or >=1.34.1 ")
+  endif ()
 
-  set (_seastar_dep_args_c-ares 1.13 REQUIRED)
-  set (_seastar_dep_args_cryptopp 5.6.5 REQUIRED)
-  set (_seastar_dep_args_fmt 5.0.0 REQUIRED)
-  set (_seastar_dep_args_lz4 1.7.3 REQUIRED)
-  set (_seastar_dep_args_GnuTLS 3.3.26 REQUIRED)
-  set (_seastar_dep_args_Protobuf 2.5.0 REQUIRED)
-  set (_seastar_dep_args_StdAtomic REQUIRED)
-  set (_seastar_dep_args_hwloc 1.11.2)
-  set (_seastar_dep_args_lksctp-tools REQUIRED)
-  set (_seastar_dep_args_rt REQUIRED)
-  set (_seastar_dep_args_yaml-cpp 0.5.1 REQUIRED)
+  if (Seastar_DPDK)
+    seastar_find_dep (dpdk)
+  endif()
+  seastar_find_dep (fmt 8.1.1 REQUIRED)
+  seastar_find_dep (lz4 1.7.3 REQUIRED)
+  seastar_find_dep (GnuTLS 3.3.26 REQUIRED)
+  if (Seastar_IO_URING)
+    seastar_find_dep (LibUring 2.0 REQUIRED)
+  endif()
+  seastar_find_dep (LinuxMembarrier)
+  seastar_find_dep (Sanitizers)
+  seastar_find_dep (SourceLocation)
+  seastar_find_dep (StdAtomic REQUIRED)
+  seastar_find_dep (SystemTap-SDT)
+  if (Seastar_HWLOC)
+    seastar_find_dep (hwloc 1.11.2 REQUIRED)
+  endif()
+  seastar_find_dep (lksctp-tools REQUIRED)
+  seastar_find_dep (rt REQUIRED)
+  seastar_find_dep (ucontext REQUIRED)
+  seastar_find_dep (yaml-cpp REQUIRED
+    VERSION 0.5.1)
 
-  foreach (third_party ${_seastar_all_dependencies})
-    find_package ("${third_party}" ${_seastar_dep_args_${third_party}})
-  endforeach ()
+  # workaround for https://gitlab.kitware.com/cmake/cmake/-/issues/25079
+  # since protobuf v22.0, it started using abseil, see
+  # https://github.com/protocolbuffers/protobuf/releases/tag/v22.0 .
+  # but due to https://gitlab.kitware.com/cmake/cmake/-/issues/25079,
+  # CMake's FindProtobuf does add this linkage yet. fortunately,
+  # ProtobufConfig.cmake provided by protobuf defines this linkage. so we try
+  # the CMake package configuration file first, and fall back to CMake's
+  # FindProtobuf module.
+  find_package (Protobuf QUIET CONFIG)
+  if (Protobuf_FOUND AND Protobuf_VERSION VERSION_GREATER_EQUAL 2.5.0)
+    # do it again, so the message is printed when the package is found
+    seastar_find_dep (Protobuf CONFIG REQUIRED)
+  else ()
+    seastar_find_dep (Protobuf 2.5.0 REQUIRED)
+  endif ()
+
 endmacro ()

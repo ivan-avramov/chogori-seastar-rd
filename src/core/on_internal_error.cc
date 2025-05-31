@@ -19,23 +19,40 @@
  * Copyright 2020 ScyllaDB
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <atomic>
+#include <exception>
+#include <stdexcept>
+#include <string_view>
+#include <cstdlib>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/log.hh>
-
-#include <atomic>
+#endif
 
 static std::atomic<bool> abort_on_internal_error{false};
 
 using namespace seastar;
 
-void seastar::set_abort_on_internal_error(bool do_abort) {
-    abort_on_internal_error.store(do_abort);
+bool seastar::set_abort_on_internal_error(bool do_abort) noexcept {
+    return abort_on_internal_error.exchange(do_abort);
+}
+
+template <typename Message>
+static void log_error_and_backtrace(logger& logger, const Message& msg) noexcept {
+    logger.error("{}, at: {}", msg, current_backtrace());
 }
 
 void seastar::on_internal_error(logger& logger, std::string_view msg) {
+    log_error_and_backtrace(logger, msg);
     if (abort_on_internal_error.load()) {
-        logger.error("{}, at: {}", msg, current_backtrace());
         abort();
     } else {
         throw_with_backtrace<std::runtime_error>(std::string(msg));
@@ -43,8 +60,8 @@ void seastar::on_internal_error(logger& logger, std::string_view msg) {
 }
 
 void seastar::on_internal_error(logger& logger, std::exception_ptr ex) {
+    log_error_and_backtrace(logger, ex);
     if (abort_on_internal_error.load()) {
-        logger.error("{}", ex);
         abort();
     } else {
         std::rethrow_exception(std::move(ex));
@@ -52,8 +69,13 @@ void seastar::on_internal_error(logger& logger, std::exception_ptr ex) {
 }
 
 void seastar::on_internal_error_noexcept(logger& logger, std::string_view msg) noexcept {
-    logger.error("{}, at: {}", msg, current_backtrace());
+    log_error_and_backtrace(logger, msg);
     if (abort_on_internal_error.load()) {
         abort();
     }
+}
+
+void seastar::on_fatal_internal_error(logger& logger, std::string_view msg) noexcept {
+    log_error_and_backtrace(logger, msg);
+    abort();
 }

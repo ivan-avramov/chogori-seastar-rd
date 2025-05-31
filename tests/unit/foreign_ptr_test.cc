@@ -20,6 +20,7 @@
  */
 
 #include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 
 #include <seastar/core/distributed.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -28,6 +29,12 @@
 #include <iostream>
 
 using namespace seastar;
+
+namespace seastar {
+
+extern logger seastar_logger;
+
+}
 
 SEASTAR_TEST_CASE(make_foreign_ptr_from_lw_shared_ptr) {
     auto p = make_foreign(make_lw_shared<sstring>("foo"));
@@ -46,7 +53,7 @@ SEASTAR_TEST_CASE(foreign_ptr_copy_test) {
     return seastar::async([] {
         auto ptr = make_foreign(make_shared<sstring>("foo"));
         BOOST_REQUIRE(ptr->size() == 3);
-        auto ptr2 = ptr.copy().get0();
+        auto ptr2 = ptr.copy().get();
         BOOST_REQUIRE(ptr2->size() == 3);
     });
 }
@@ -101,7 +108,7 @@ SEASTAR_TEST_CASE(foreign_ptr_cpu_test) {
     return seastar::async([] {
         auto p = smp::submit_to(1, [] {
             return make_foreign(std::make_unique<dummy>());
-        }).get0();
+        }).get();
 
         p.reset(std::make_unique<dummy>());
     }).then([] {
@@ -121,7 +128,7 @@ SEASTAR_TEST_CASE(foreign_ptr_move_assignment_test) {
     return seastar::async([] {
         auto p = smp::submit_to(1, [] {
             return make_foreign(std::make_unique<dummy>());
-        }).get0();
+        }).get();
 
         p = foreign_ptr<std::unique_ptr<dummy>>();
     }).then([] {
@@ -130,3 +137,39 @@ SEASTAR_TEST_CASE(foreign_ptr_move_assignment_test) {
     });
 }
 
+SEASTAR_THREAD_TEST_CASE(foreign_ptr_destroy_test) {
+    if (smp::count == 1) {
+        std::cerr << "Skipping multi-cpu foreign_ptr tests. Run with --smp=2 to test multi-cpu delete and reset.";
+        return;
+    }
+
+    using namespace std::chrono_literals;
+
+    std::vector<promise<bool>> done;
+    done.resize(smp::count);
+
+    struct deferred {
+        std::vector<promise<bool>>& done;
+        deferred(std::vector<promise<bool>>& done_)
+            : done(done_)
+        {}
+        ~deferred() {
+            seastar_logger.info("~deferred");
+            internal::run_in_background([&done = done, shard = this_shard_id()] {
+                return smp::submit_to(0, [&done, shard] {
+                    done[shard].set_value(true);
+                    done[shard ^ 1].set_value(false);
+                });
+            });
+        }
+    };
+
+    auto val = smp::submit_to(1, [&] () mutable {
+        return make_foreign(std::make_unique<deferred>(done));
+    }).get();
+
+    val.destroy().get();
+
+    BOOST_REQUIRE_EQUAL(done[1].get_future().get(), true);
+    BOOST_REQUIRE_EQUAL(done[0].get_future().get(), false);
+}

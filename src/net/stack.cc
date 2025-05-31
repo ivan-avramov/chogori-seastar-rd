@@ -19,8 +19,23 @@
  * Copyright 2015 Cloudius Systems
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <memory>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
+#include <seastar/core/metrics_api.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/net/stack.hh>
 #include <seastar/net/inet_address.hh>
+#endif
 
 namespace seastar {
 
@@ -33,48 +48,52 @@ static_assert(std::is_nothrow_move_constructible_v<socket>);
 static_assert(std::is_nothrow_default_constructible_v<server_socket>);
 static_assert(std::is_nothrow_move_constructible_v<server_socket>);
 
-net::udp_channel::udp_channel() noexcept
+net::datagram_channel::datagram_channel() noexcept
 {}
 
-net::udp_channel::udp_channel(std::unique_ptr<udp_channel_impl> impl) noexcept : _impl(std::move(impl))
+net::datagram_channel::datagram_channel(std::unique_ptr<datagram_channel_impl> impl) noexcept : _impl(std::move(impl))
 {}
 
-net::udp_channel::~udp_channel()
+net::datagram_channel::~datagram_channel()
 {}
 
-net::udp_channel::udp_channel(udp_channel&&) noexcept = default;
-net::udp_channel& net::udp_channel::operator=(udp_channel&&) noexcept = default;
+net::datagram_channel::datagram_channel(datagram_channel&&) noexcept = default;
+net::datagram_channel& net::datagram_channel::operator=(datagram_channel&&) noexcept = default;
 
-socket_address net::udp_channel::local_address() const {
-    return _impl->local_address();
+socket_address net::datagram_channel::local_address() const {
+    if (_impl) {
+        return _impl->local_address();
+    } else {
+        return {};
+    }
 }
 
-future<net::udp_datagram> net::udp_channel::receive() {
+future<net::datagram> net::datagram_channel::receive() {
     return _impl->receive();
 }
 
-future<> net::udp_channel::send(const socket_address& dst, const char* msg) {
+future<> net::datagram_channel::send(const socket_address& dst, const char* msg) {
     return _impl->send(dst, msg);
 }
 
-future<> net::udp_channel::send(const socket_address& dst, packet p) {
+future<> net::datagram_channel::send(const socket_address& dst, packet p) {
     return _impl->send(dst, std::move(p));
 }
 
-bool net::udp_channel::is_closed() const {
+bool net::datagram_channel::is_closed() const {
     return _impl->is_closed();
 }
 
-void net::udp_channel::shutdown_input() {
+void net::datagram_channel::shutdown_input() {
     _impl->shutdown_input();
 }
 
-void net::udp_channel::shutdown_output() {
+void net::datagram_channel::shutdown_output() {
     _impl->shutdown_output();
 }
 
 
-void net::udp_channel::close() {
+void net::datagram_channel::close() {
     return _impl->close();
 }
 
@@ -97,8 +116,10 @@ input_stream<char> connected_socket::input(connected_socket_input_stream_config 
 }
 
 output_stream<char> connected_socket::output(size_t buffer_size) {
+    output_stream_options opts;
+    opts.batch_flushes = true;
     // TODO: allow user to determine buffer size etc
-    return output_stream<char>(_csi->sink(), buffer_size, false, buffer_size>0);
+    return output_stream<char>(_csi->sink(), buffer_size, opts);
 }
 
 void connected_socket::set_nodelay(bool nodelay) {
@@ -127,12 +148,24 @@ int connected_socket::get_sockopt(int level, int optname, void* data, size_t len
     return _csi->get_sockopt(level, optname, data, len);
 }
 
+socket_address connected_socket::local_address() const noexcept {
+    return _csi->local_address();
+}
+
+socket_address connected_socket::remote_address() const noexcept {
+    return _csi->remote_address();
+}
+
 void connected_socket::shutdown_output() {
     _csi->shutdown_output();
 }
 
 void connected_socket::shutdown_input() {
     _csi->shutdown_input();
+}
+
+future<> connected_socket::wait_input_shutdown() {
+    return _csi->wait_input_shutdown();
 }
 
 data_source
@@ -202,7 +235,7 @@ network_interface::network_interface(shared_ptr<net::network_interface_impl> imp
 
 network_interface::network_interface(network_interface&&) noexcept = default;
 network_interface& network_interface::operator=(network_interface&&) noexcept = default;
-    
+
 uint32_t network_interface::index() const {
     return _impl->index();
 }
@@ -253,6 +286,23 @@ network_stack::connect(socket_address sa, socket_address local, transport proto)
 
 std::vector<network_interface> network_stack::network_interfaces() {
     return {};
+}
+
+void register_net_metrics_for_scheduling_group(
+    metrics::metric_groups &metrics, unsigned sg_id, const metrics::label_instance& name) {
+    namespace sm = seastar::metrics;
+    metrics.add_group("network", {
+        sm::make_counter("bytes_sent", [sg_id] { return engine().net().stats(sg_id).bytes_sent; },
+                sm::description("Counts the number of bytes written to network sockets."), {name}),
+        sm::make_counter("bytes_received", [sg_id] { return engine().net().stats(sg_id).bytes_received; },
+                sm::description("Counts the number of bytes received from network sockets."), {name}),
+    });
+
+    // need to clear stats in case we recreated a SG with the same id
+    // but avoid during reactor startup
+    if (engine_is_ready()) {
+        engine().net().clear_stats(sg_id);
+    }
 }
 
 }

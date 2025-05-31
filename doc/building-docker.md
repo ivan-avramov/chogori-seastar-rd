@@ -3,21 +3,20 @@
 To build a Docker image:
 
 ```
-docker build -t seastar-dev docker/dev
+docker build -t seastar-dev -f docker/dev/Dockerfile .
 ```
 
-Create an shell function for building insider the container (bash syntax given):
+Building is done with two commands:
+
+```
+$ ./configure.py
+$ ninja -C build/release
+```
+
+You can run them inside container, e.g. like this
 
 ```
 $ seabuild() { docker run -v $HOME/seastar/:/seastar -u $(id -u):$(id -g) -w /seastar -t seastar-dev "$@"; }
-```
-
-(it is recommended to put this inside your .bashrc or similar)
-
-To build inside a container:
-
-```
-$ seabuild ./configure.py
+$ seabuild ./configure.py
 $ seabuild ninja -C build/release
 ```
-

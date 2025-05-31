@@ -21,40 +21,43 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
+#include <limits>
+#include <cctype>
+#include <vector>
+#include <boost/intrusive/list.hpp>
+#endif
 #include <seastar/http/request_parser.hh>
 #include <seastar/http/request.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/app-template.hh>
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/distributed.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/util/std-compat.hh>
-#include <iostream>
-#include <algorithm>
-#include <unordered_map>
-#include <queue>
-#include <bitset>
-#include <limits>
-#include <cctype>
-#include <vector>
-#include <boost/intrusive/list.hpp>
+#include <seastar/util/modules.hh>
 #include <seastar/http/routes.hh>
 #include <seastar/net/tls.hh>
 #include <seastar/core/shared_ptr.hh>
 
 namespace seastar {
 
+namespace http {
+SEASTAR_MODULE_EXPORT
+struct reply;
+}
+
 namespace httpd {
 
+SEASTAR_MODULE_EXPORT
 class http_server;
+SEASTAR_MODULE_EXPORT
 class http_stats;
-struct reply;
 
 using namespace std::chrono_literals;
 
+SEASTAR_MODULE_EXPORT_BEGIN
 class http_stats {
     metrics::metric_groups _metric_groups;
 public:
@@ -66,19 +69,40 @@ class connection : public boost::intrusive::list_base_hook<> {
     connected_socket _fd;
     input_stream<char> _read_buf;
     output_stream<char> _write_buf;
+    socket_address _client_addr;
+    socket_address _server_addr;
     static constexpr size_t limit = 4096;
     using tmp_buf = temporary_buffer<char>;
     http_request_parser _parser;
-    std::unique_ptr<request> _req;
-    std::unique_ptr<reply> _resp;
+    std::unique_ptr<http::request> _req;
+    std::unique_ptr<http::reply> _resp;
     // null element marks eof
-    queue<std::unique_ptr<reply>> _replies { 10 };
+    queue<std::unique_ptr<http::reply>> _replies { 10 };
     bool _done = false;
+    const bool _tls;
 public:
+    [[deprecated("use connection(http_server&, connected_socket&&, bool tls)")]]
+    connection(http_server& server, connected_socket&& fd, socket_address, bool tls)
+            : connection(server, std::move(fd), tls) {}
+    connection(http_server& server, connected_socket&& fd, bool tls)
+            : _server(server)
+            , _fd(std::move(fd))
+            , _read_buf(_fd.input())
+            , _write_buf(_fd.output())
+            , _client_addr(_fd.remote_address())
+            , _server_addr(_fd.local_address())
+            , _tls(tls) {
+        on_new_connection();
+    }
     connection(http_server& server, connected_socket&& fd,
-            socket_address addr)
-            : _server(server), _fd(std::move(fd)), _read_buf(_fd.input()), _write_buf(
-                    _fd.output()) {
+            socket_address client_addr, socket_address server_addr, bool tls)
+            : _server(server)
+            , _fd(std::move(fd))
+            , _read_buf(_fd.input())
+            , _write_buf(_fd.output())
+            , _client_addr(std::move(client_addr))
+            , _server_addr(std::move(server_addr))
+            , _tls(tls) {
         on_new_connection();
     }
     ~connection();
@@ -91,37 +115,12 @@ public:
     future<> respond();
     future<> do_response_loop();
 
-    void set_headers(reply& resp);
+    void set_headers(http::reply& resp);
 
     future<> start_response();
-    future<> write_reply_headers(std::unordered_map<sstring, sstring>::iterator hi);
 
-    static short hex_to_byte(char c);
-
-    /**
-     * Convert a hex encoded 2 bytes substring to char
-     */
-    static char hexstr_to_char(const std::string_view& in, size_t from);
-
-    /**
-     * URL_decode a substring and place it in the given out sstring
-     */
-    static bool url_decode(const std::string_view& in, sstring& out);
-
-    /**
-     * Add a single query parameter to the parameter list
-     */
-    static void add_param(request& req, const std::string_view& param);
-
-    /**
-     * Set the query parameters in the request objects.
-     * query param appear after the question mark and are separated
-     * by the ampersand sign
-     */
-    static sstring set_query_param(request& req);
-
-    future<bool> generate_reply(std::unique_ptr<request> req);
-    void generate_error_reply_and_close(std::unique_ptr<request> req, reply::status_type status, const sstring& msg);
+    future<bool> generate_reply(std::unique_ptr<http::request> req);
+    void generate_error_reply_and_close(std::unique_ptr<http::request> req, http::reply::status_type status, const sstring& msg);
 
     future<> write_body();
 
@@ -142,10 +141,12 @@ class http_server {
     sstring _date = http_date();
     timer<> _date_format_timer { [this] {_date = http_date();} };
     size_t _content_length_limit = std::numeric_limits<size_t>::max();
+    bool _content_streaming = false;
     gate _task_gate;
 public:
     routes _routes;
     using connection = seastar::httpd::connection;
+    using server_credentials_ptr = shared_ptr<seastar::tls::server_credentials>;
     explicit http_server(const sstring& name) : _stats(*this, name) {
         _date_format_timer.arm_periodic(1s);
     }
@@ -175,17 +176,25 @@ public:
         }).get();
      *
      */
-    void set_tls_credentials(shared_ptr<seastar::tls::server_credentials> credentials);
+    [[deprecated("use listen(socket_address addr, server_credentials_ptr credentials)")]]
+    void set_tls_credentials(server_credentials_ptr credentials);
 
     size_t get_content_length_limit() const;
 
     void set_content_length_limit(size_t limit);
 
+    bool get_content_streaming() const;
+
+    void set_content_streaming(bool b);
+
+    future<> listen(socket_address addr, server_credentials_ptr credentials);
+    future<> listen(socket_address addr, listen_options lo, server_credentials_ptr credentials);
     future<> listen(socket_address addr, listen_options lo);
     future<> listen(socket_address addr);
     future<> stop();
 
     future<> do_accepts(int which);
+    future<> do_accepts(int which, bool with_tls);
 
     uint64_t total_connections() const;
     uint64_t current_connections() const;
@@ -196,7 +205,7 @@ public:
     // RFC 7231, Section 7.1.1.1.
     static sstring http_date();
 private:
-    future<> do_accept_one(int which);
+    future<> do_accept_one(int which, bool with_tls);
     boost::intrusive::list<connection> _connections;
     friend class seastar::httpd::connection;
     friend class http_server_tester;
@@ -231,13 +240,15 @@ public:
     }
 
     future<> start(const sstring& name = generate_server_name());
-    future<> stop();
+    future<> stop() noexcept;
     future<> set_routes(std::function<void(routes& r)> fun);
     future<> listen(socket_address addr);
+    future<> listen(socket_address addr, http_server::server_credentials_ptr credentials);
     future<> listen(socket_address addr, listen_options lo);
+    future<> listen(socket_address addr, listen_options lo, http_server::server_credentials_ptr credentials);
     distributed<http_server>& server();
 };
-
+SEASTAR_MODULE_EXPORT_END
 }
 
 }

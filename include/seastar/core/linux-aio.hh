@@ -24,7 +24,6 @@
 #include <endian.h>
 #include <sys/time.h>
 #include <sys/uio.h>
-#include <signal.h>
 #include <cstdint>
 
 namespace seastar {
@@ -97,7 +96,6 @@ linux_abi::iocb make_writev_iocb(int fd, uint64_t offset, const ::iovec* iov, si
 linux_abi::iocb make_poll_iocb(int fd, uint32_t events);
 
 void set_user_data(linux_abi::iocb& iocb, void* data);
-void* get_user_data(const linux_abi::iocb& iocb);
 void set_nowait(linux_abi::iocb& iocb, bool nowait);
 
 void set_eventfd_notification(linux_abi::iocb& iocb, int eventfd);
@@ -105,7 +103,7 @@ void set_eventfd_notification(linux_abi::iocb& iocb, int eventfd);
 linux_abi::iocb* get_iocb(const linux_abi::io_event& ioev);
 
 int io_setup(int nr_events, linux_abi::aio_context_t* io_context);
-int io_destroy(linux_abi::aio_context_t io_context);
+int io_destroy(linux_abi::aio_context_t io_context) noexcept;
 int io_submit(linux_abi::aio_context_t io_context, long nr, linux_abi::iocb** iocbs);
 int io_cancel(linux_abi::aio_context_t io_context, linux_abi::iocb* iocb, linux_abi::io_event* result);
 int io_getevents(linux_abi::aio_context_t io_context, long min_nr, long nr, linux_abi::io_event* events, const ::timespec* timeout,
@@ -194,10 +192,14 @@ set_user_data(linux_abi::iocb& iocb, void* data) {
     iocb.aio_data = reinterpret_cast<uintptr_t>(data);
 }
 
-inline
-void*
-get_user_data(const linux_abi::iocb& iocb) {
-    return reinterpret_cast<void*>(uintptr_t(iocb.aio_data));
+template <typename T>
+inline T* get_user_data(const linux_abi::iocb& iocb) noexcept {
+    return reinterpret_cast<T*>(uintptr_t(iocb.aio_data));
+}
+
+template <typename T>
+inline T* get_user_data(const linux_abi::io_event& ev) noexcept {
+    return reinterpret_cast<T*>(uintptr_t(ev.data));
 }
 
 inline

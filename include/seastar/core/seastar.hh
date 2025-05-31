@@ -41,6 +41,8 @@
 ///          continuations, also known as fibers
 ///   - \ref thread-module Support for traditional threaded execution
 ///   - \ref rpc Build high-level communication protocols
+///   - \ref websocket (experimental) Implement a WebSocket-based server
+///   - \ref fsnotifier (experimental) Implement a filesystem modification notifier.
 ///
 /// View the [Seastar compatibility statement](./md_compatibility.html) for
 /// information about library evolution.
@@ -48,11 +50,21 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/file-types.hh>
+#include <seastar/core/posix.hh>
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/modules.hh>
 #include "./internal/api-level.hh"
+#ifndef SEASTAR_MODULE
+#include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <string_view>
+#endif
 
 namespace seastar {
+
+SEASTAR_MODULE_EXPORT_BEGIN
 
 // iostream.hh
 template <class CharType> class input_stream;
@@ -72,8 +84,14 @@ struct stat_data;
 
 namespace net {
 
-class udp_channel;
+using udp_channel = class datagram_channel;
 
+}
+
+namespace experimental {
+// process.hh
+class process;
+struct spawn_parameters;
 }
 
 // Networking API
@@ -148,6 +166,7 @@ socket make_socket();
 /// for sending.
 ///
 /// \return a \ref net::udp_channel object that can be used for UDP transfers.
+[[deprecated("Use `make_unbound_datagram_channel` instead")]]
 net::udp_channel make_udp_channel();
 
 
@@ -156,7 +175,35 @@ net::udp_channel make_udp_channel();
 /// \param local local address to bind to
 ///
 /// \return a \ref net::udp_channel object that can be used for UDP transfers.
+[[deprecated("Use `make_bound_datagram_channel` instead")]]
 net::udp_channel make_udp_channel(const socket_address& local);
+
+/// Creates a datagram_channel object suitable for sending datagrams to
+/// destinations that belong to the provided address family.
+/// Supported address families: AF_INET, AF_INET6 and AF_UNIX.
+///
+/// Setting family to AF_INET or AF_INET6 creates a datagram_channel that uses
+/// UDP protocol. AF_UNIX creates a datagram_channel that uses UNIX domain
+/// sockets.
+///
+/// The channel is not bound to a local address, and thus can only be used
+/// for sending.
+///
+/// \param family address family in which the \ref datagram_channel will operate
+///
+/// \return a \ref net::datagram_channel object for sending datagrams in a
+/// specified address family.
+net::datagram_channel make_unbound_datagram_channel(sa_family_t family);
+
+/// Creates a datagram_channel object suitable for sending and receiving
+/// datagrams to/from destinations that belong to the provided address family.
+/// Supported address families: AF_INET, AF_INET6 and AF_UNIX.
+///
+/// \param local local address to bind to
+///
+/// \return a \ref net::datagram_channel object for sending/receiving datagrams
+/// in a specified address family.
+net::datagram_channel make_bound_datagram_channel(const socket_address& local);
 
 /// @}
 
@@ -312,6 +359,21 @@ using follow_symlink = bool_class<follow_symlink_tag>;
 /// with follow_symlink::yes, or for the link itself, with follow_symlink::no.
 future<stat_data> file_stat(std::string_view name, follow_symlink fs = follow_symlink::yes) noexcept;
 
+/// Wrapper around getgrnam_r.
+/// If the provided group name does not exist in the group database, this call will return an empty optional.
+/// If the provided group name exists in the group database, the optional returned will contain the struct group_details information.
+/// When an unexpected error is thrown by the getgrnam_r libc call, this function throws std::system_error with std::error_code.
+/// \param groupname name of the group
+///
+/// \return optional struct group_details of the group identified by name. struct group_details has details of the group from the group database.
+future<std::optional<struct group_details>> getgrnam(std::string_view name);
+
+/// Change the owner and group of file. This is a wrapper around chown syscall.
+/// The function throws std::system_error, when the chown syscall fails.
+/// \param filepath
+/// \param owner
+/// \param group
+future<> chown(std::string_view filepath, uid_t owner, gid_t group);
 /// Return the size of a file.
 ///
 /// \param name name of the file to return the size
@@ -382,5 +444,49 @@ future<uint64_t> fs_avail(std::string_view name) noexcept;
 /// \param name name of the file to inspect
 future<uint64_t> fs_free(std::string_view name) noexcept;
 /// @}
+
+/// Return filesystem-wide space_info where a file is located.
+///
+/// \param name name of the file in the filesystem to inspect
+future<std::filesystem::space_info> file_system_space(std::string_view name) noexcept;
+
+namespace experimental {
+/// \defgroup interprocess-module Interprocess Communication
+///
+/// Seastar provides a set of APIs for interprocess communicate
+
+/// \addtogroup interprocess-module
+/// @{
+
+/// Create a pipe using \c pipe2
+///
+/// \return a tuple of \c file_desc, the first one for reading from the pipe, the second
+/// for writing to it.
+future<std::tuple<file_desc, file_desc>> make_pipe();
+
+/// Spawn a subprocess
+///
+/// \param pathname the path to the executable
+/// \param params parameters for spawning the subprocess
+///
+/// \return a process representing the spawned subprocess
+/// \note
+/// the subprocess is spawned with \c posix_spawn() system call, so the
+/// pathname should be relative or absolute path of the executable.
+future<process> spawn_process(const std::filesystem::path& pathname,
+                              spawn_parameters params);
+/// Spawn a subprocess
+///
+/// \param pathname the path to the executable
+///
+/// \return a process representing the spawned subprocess
+/// \note
+/// the this overload does not specify a \c params parameters for spawning the
+/// subprocess. Instead, it uses the pathname for the \c argv[0] in the params.
+future<process> spawn_process(const std::filesystem::path& pathname);
+/// @}
+}
+
+SEASTAR_MODULE_EXPORT_END
 
 }

@@ -18,19 +18,32 @@
 /*
  * Copyright 2017 ScyllaDB
  */
-#include <seastar/util/backtrace.hh>
+#ifdef SEASTAR_MODULE
+module;
+#endif
 
 #include <link.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cstddef>
+#include <cerrno>
+#include <cstring>
+#include <iostream>
+#include <variant>
+#include <vector>
+#include <boost/container/static_vector.hpp>
+#include <fmt/ostream.h>
+#include <fmt/ranges.h>
 
-#include <errno.h>
-#include <string.h>
-
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
+#include <seastar/util/backtrace.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/reactor.hh>
-
+#endif
 
 namespace seastar {
 
@@ -40,8 +53,8 @@ static int dl_iterate_phdr_callback(struct dl_phdr_info *info, size_t size, void
     for (int i = 0; i < info->dlpi_phnum; i++) {
         const auto hdr = info->dlpi_phdr[i];
 
-        // Only account loadable, executable (text) segments
-        if (hdr.p_type == PT_LOAD && (hdr.p_flags & PF_X) == PF_X) {
+        // Only account loadable segments
+        if (hdr.p_type == PT_LOAD) {
             total_size += hdr.p_memsz;
         }
     }
@@ -61,11 +74,11 @@ static std::vector<shared_object> enumerate_shared_objects() {
 static const std::vector<shared_object> shared_objects{enumerate_shared_objects()};
 static const shared_object uknown_shared_object{"", 0, std::numeric_limits<uintptr_t>::max()};
 
-bool operator==(const frame& a, const frame& b) {
+bool operator==(const frame& a, const frame& b) noexcept {
     return a.so == b.so && a.addr == b.addr;
 }
 
-frame decorate(uintptr_t addr) {
+frame decorate(uintptr_t addr) noexcept {
     // If the shared-objects are not enumerated yet, or the enumeration
     // failed return the addr as-is with a dummy shared-object.
     if (shared_objects.empty()) {
@@ -91,7 +104,7 @@ simple_backtrace current_backtrace_tasklocal() noexcept {
     return simple_backtrace(std::move(v));
 }
 
-size_t simple_backtrace::calculate_hash() const {
+size_t simple_backtrace::calculate_hash() const noexcept {
     size_t h = 0;
     for (auto f : _frames) {
         h = ((h << 5) - h) ^ (f.so->begin + f.addr);
@@ -100,35 +113,23 @@ size_t simple_backtrace::calculate_hash() const {
 }
 
 std::ostream& operator<<(std::ostream& out, const frame& f) {
-    if (!f.so->name.empty()) {
-        out << f.so->name << "+";
-    }
-    out << format("0x{:x}", f.addr);
+    fmt::print(out, "{}", f);
     return out;
 }
 
 std::ostream& operator<<(std::ostream& out, const simple_backtrace& b) {
-    for (auto f : b._frames) {
-        out << "   " << f << "\n";
-    }
+    fmt::print(out, "{}", b);
     return out;
 }
 
 std::ostream& operator<<(std::ostream& out, const tasktrace& b) {
-    out << b._main;
-    for (auto&& e : b._prev) {
-        out << "   --------\n";
-        std::visit(make_visitor([&] (const shared_backtrace& sb) {
-            out << sb;
-        }, [&] (const task_entry& f) {
-            out << "   " << f << "\n";
-        }), e);
-    }
+    fmt::print(out, "{}", b);
     return out;
 }
 
 std::ostream& operator<<(std::ostream& out, const task_entry& e) {
-    return out << seastar::pretty_type_name(*e._task_type);
+    fmt::print(out, "{}", e);
+    return out;
 }
 
 tasktrace current_tasktrace() noexcept {
@@ -168,17 +169,57 @@ saved_backtrace current_backtrace() noexcept {
     return current_tasktrace();
 }
 
-tasktrace::tasktrace(simple_backtrace main, tasktrace::vector_type prev, size_t prev_hash, scheduling_group sg)
+tasktrace::tasktrace(simple_backtrace main, tasktrace::vector_type prev, size_t prev_hash, scheduling_group sg) noexcept
     : _main(std::move(main))
     , _prev(std::move(prev))
     , _sg(sg)
     , _hash(_main.hash() * 31 ^ prev_hash)
 { }
 
-bool tasktrace::operator==(const tasktrace& o) const {
+bool tasktrace::operator==(const tasktrace& o) const noexcept {
     return _hash == o._hash && _main == o._main && _prev == o._prev;
 }
 
 tasktrace::~tasktrace() {}
 
 } // namespace seastar
+
+namespace fmt {
+
+auto formatter<seastar::frame>::format(const seastar::frame& f, format_context& ctx) const
+    -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    if (!f.so->name.empty()) {
+        out = fmt::format_to(out, "{}+", f.so->name);
+    }
+    return fmt::format_to(out, "0x{:x}", f.addr);
+}
+
+auto formatter<seastar::simple_backtrace>::format(const seastar::simple_backtrace& b, format_context& ctx) const
+    -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{}", fmt::join(b._frames, " "));
+}
+
+auto formatter<seastar::tasktrace>::format(const seastar::tasktrace& b, format_context& ctx) const
+    -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    out = fmt::format_to(out, "{}", b._main);
+    for (auto&& e : b._prev) {
+        out = fmt::format_to(out,  "\n   --------");
+        out = std::visit(seastar::make_visitor(
+            [&] (const seastar::shared_backtrace& sb) {
+                return fmt::format_to(out,  "\n{}", sb);
+            },
+            [&] (const seastar::task_entry& f) {
+                return fmt::format_to(out,  "\n   {}", f);
+            }), e);
+    }
+    return out;
+}
+
+auto formatter<seastar::task_entry>::format(const seastar::task_entry& e, format_context& ctx) const
+    -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{}", seastar::pretty_type_name(*e._task_type));
+}
+
+}

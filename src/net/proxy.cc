@@ -15,8 +15,21 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-#include <seastar/net/proxy.hh>
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
 #include <utility>
+#include <vector>
+#include <cstdlib>
+#include <cstdint>
+#include <memory>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
+#include <seastar/net/proxy.hh>
+#endif
 
 namespace seastar {
 
@@ -50,7 +63,7 @@ uint32_t proxy_net_device::send(circular_buffer<packet>& p)
         return 0;
     }
 
-    for (size_t i = 0; !p.empty() && _send_depth < _send_queue_length; i++, _send_depth++) {
+    for (; !p.empty() && _send_depth < _send_queue_length; _send_depth++) {
         _moving.push_back(std::move(p.front()));
         p.pop_front();
     }

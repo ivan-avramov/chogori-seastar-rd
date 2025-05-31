@@ -22,15 +22,20 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <chrono>
-#include <functional>
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/manual_clock.hh>
 #include <seastar/core/timer.hh>
+#include <seastar/util/modules.hh>
+#endif
 
 namespace seastar {
+
+SEASTAR_MODULE_EXPORT_BEGIN
 
 /// \file
 
@@ -50,13 +55,13 @@ future<> sleep(std::chrono::duration<Rep, Period> dur) {
             tmr.arm(dur);
         }
     };
-    sleeper *s = new sleeper(dur);
+    auto s = std::make_unique<sleeper>(dur);
     future<> fut = s->done.get_future();
-    return fut.then([s] { delete s; });
+    return fut.finally([s = std::move(s)] {});
 }
 
 /// exception that is thrown when application is in process of been stopped
-class sleep_aborted : public std::exception {
+class sleep_aborted : public abort_requested_exception {
 public:
     /// Reports the exception reason.
     virtual const char* what() const noexcept {
@@ -89,5 +94,7 @@ future<> sleep_abortable(typename Clock::duration dur, abort_source& as);
 
 extern template future<> sleep_abortable<steady_clock_type>(typename steady_clock_type::duration, abort_source&);
 extern template future<> sleep_abortable<lowres_clock>(typename lowres_clock::duration, abort_source&);
+extern template future<> sleep_abortable<manual_clock>(typename manual_clock::duration, abort_source&);
 
+SEASTAR_MODULE_EXPORT_END
 }

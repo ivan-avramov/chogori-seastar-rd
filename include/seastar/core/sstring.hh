@@ -21,28 +21,49 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <stdint.h>
 #include <algorithm>
+#if __has_include(<compare>)
+#include <compare>
+#endif
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <cstring>
-#include <stdexcept>
 #include <initializer_list>
 #include <istream>
 #include <ostream>
 #include <functional>
-#include <cstdio>
 #include <type_traits>
+#include <fmt/format.h>
+#if FMT_VERSION >= 110000
+#include <fmt/ranges.h>
+#endif
+#endif
+#include <seastar/util/assert.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/modules.hh>
 #include <seastar/core/temporary_buffer.hh>
 
 namespace seastar {
 
+SEASTAR_MODULE_EXPORT_BEGIN
+
 template <typename char_type, typename Size, Size max_size, bool NulTerminate = true>
 class basic_sstring;
 
+#ifdef SEASTAR_SSTRING
+// Older std::string used atomic reference counting and had no small-buffer-optimization.
+// At some point the new std::string ABI improved -- no reference counting plus the small
+// buffer optimization. However, aliasing seastar::sstring to std::string still ends up
+// with a small performance degradation. (FIXME?)
 using sstring = basic_sstring<char, uint32_t, 15>;
+#else
+using sstring = std::string;
+#endif
+
+SEASTAR_MODULE_EXPORT_END
 
 namespace internal {
 [[noreturn]] void throw_bad_alloc();
@@ -50,12 +71,13 @@ namespace internal {
 [[noreturn]] void throw_sstring_out_of_range();
 }
 
+SEASTAR_MODULE_EXPORT
 template <typename char_type, typename Size, Size max_size, bool NulTerminate>
 class basic_sstring {
     static_assert(
-            (std::is_same<char_type, char>::value
-             || std::is_same<char_type, signed char>::value
-             || std::is_same<char_type, unsigned char>::value),
+            (std::is_same_v<char_type, char>
+             || std::is_same_v<char_type, signed char>
+             || std::is_same_v<char_type, unsigned char>),
             "basic_sstring only supports single byte char types");
     union contents {
         struct external_type {
@@ -71,7 +93,11 @@ class basic_sstring {
         static_assert(max_size <= 127, "max_size too large");
     } u;
     bool is_internal() const noexcept {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
         return u.internal.size >= 0;
+#pragma GCC diagnostic pop
     }
     bool is_external() const noexcept {
         return !is_internal();
@@ -196,7 +222,11 @@ public:
     }
     ~basic_sstring() noexcept {
         if (is_external()) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
             std::free(u.external.str);
+#pragma GCC diagnostic pop
         }
     }
     basic_sstring& operator=(const basic_sstring& x) {
@@ -235,25 +265,59 @@ public:
         return npos;
     }
 
-    size_t find(const basic_sstring& s, size_t pos = 0) const noexcept {
+    size_t find(const char_type* c_str, size_t pos, size_t len2) const noexcept {
+        SEASTAR_ASSERT(c_str != nullptr || len2 == 0);
+        if (pos > size()) {
+            return npos;
+        }
+
+        if (len2 == 0) {
+            return pos;
+        }
+
         const char_type* it = str() + pos;
         const char_type* end = str() + size();
-        const char_type* c_str = s.str();
-        const char_type* c_str_end = s.str() + s.size();
+        size_t len1 = end - it;
+        if (len1 < len2) {
+            return npos;
+        }
 
-        while (it < end) {
-            auto i = it;
-            auto j = c_str;
-            while ( i < end && j < c_str_end && *i == *j) {
-                i++;
-                j++;
+        char_type f2 = *c_str;
+        while (true) {
+            len1 = end - it;
+            if (len1 < len2) {
+                return npos;
             }
-            if (j == c_str_end) {
+
+            // find the first byte of pattern string matching in source string
+            it = traits_type::find(it, len1 - len2 + 1, f2);
+            if (it == nullptr) {
+                return npos;
+            }
+
+            if (traits_type::compare(it, c_str, len2) == 0) {
                 return it - str();
             }
-            it++;
+
+            ++it;
         }
-        return npos;
+    }
+
+    constexpr size_t find(const char_type* s, size_t pos = 0) const noexcept {
+        return find(s, pos, traits_type::length(s));
+    }
+
+    size_t find(const basic_sstring& s, size_t pos = 0) const noexcept {
+        return find(s.str(), pos, s.size());
+    }
+
+    template<class StringViewLike,
+             std::enable_if_t<std::is_convertible_v<StringViewLike,
+                                                    std::basic_string_view<char_type, traits_type>>,
+                              int> = 0>
+    size_t find(const StringViewLike& sv_like, size_type pos = 0) const noexcept {
+        std::basic_string_view<char_type, traits_type> sv = sv_like;
+        return find(sv.data(), pos, sv.size());
     }
 
     /**
@@ -291,6 +355,22 @@ public:
         std::copy(s, s + n, ret.begin() + size());
         *this = std::move(ret);
         return *this;
+    }
+
+    /**
+     *  Resize string and use the specified @c op to modify the content and the length
+     *  @param n  new size
+     *  @param op the function object used for setting the new content of the string
+     */
+    template <class Operation>
+    requires std::is_invocable_r_v<size_t, Operation, char_type*, size_t>
+    void resize_and_overwrite(size_t n, Operation op) {
+        if (n > size()) {
+            *this = basic_sstring(initialized_later(), n);
+        }
+        size_t r = std::move(op)(data(), n);
+        SEASTAR_ASSERT(r <= n);
+        resize(r);
     }
 
     /**
@@ -390,6 +470,29 @@ public:
         replace(p, p, beg, end);
     }
 
+
+    /**
+     *  Returns a read/write reference to the data at the first
+     *  element of the string.
+     *  This function shall not be called on empty strings.
+     */
+    reference
+    front() noexcept {
+        SEASTAR_ASSERT(!empty());
+        return *str();
+    }
+
+    /**
+     *  Returns a  read-only (constant) reference to the data at the first
+     *  element of the string.
+     *  This function shall not be called on empty strings.
+     */
+    const_reference
+    front() const noexcept {
+        SEASTAR_ASSERT(!empty());
+        return *str();
+    }
+
     /**
      *  Returns a read/write reference to the data at the last
      *  element of the string.
@@ -470,7 +573,7 @@ public:
         }
     }
     int compare(std::basic_string_view<char_type, traits_type> x) const noexcept {
-        auto n = traits_type::compare(begin(), x.begin(), std::min(size(), x.size()));
+        auto n = traits_type::compare(begin(), x.data(), std::min(size(), x.size()));
         if (n != 0) {
             return n;
         }
@@ -489,7 +592,7 @@ public:
         }
 
         sz = std::min(size() - pos, sz);
-        auto n = traits_type::compare(begin() + pos, x.begin(), std::min(sz, x.size()));
+        auto n = traits_type::compare(begin() + pos, x.data(), std::min(sz, x.size()));
         if (n != 0) {
             return n;
         }
@@ -500,6 +603,42 @@ public:
         } else {
             return 0;
         }
+    }
+
+    constexpr bool starts_with(std::basic_string_view<char_type, traits_type> sv) const noexcept {
+        return size() >= sv.size() && compare(0, sv.size(), sv) == 0;
+    }
+
+    constexpr bool starts_with(char_type c) const noexcept {
+        return !empty() && traits_type::eq(front(), c);
+    }
+
+    constexpr bool starts_with(const char_type* s) const noexcept {
+        return starts_with(std::basic_string_view<char_type, traits_type>(s));
+    }
+
+    constexpr bool ends_with(std::basic_string_view<char_type, traits_type> sv) const noexcept {
+        return size() >= sv.size() && compare(size() - sv.size(), npos, sv) == 0;
+    }
+
+    constexpr bool ends_with(char_type c) const noexcept {
+        return !empty() && traits_type::eq(back(), c);
+    }
+
+    constexpr bool ends_with(const char_type* s) const noexcept {
+        return ends_with(std::basic_string_view<char_type, traits_type>(s));
+    }
+
+    constexpr bool contains(std::basic_string_view<char_type, traits_type> sv) const noexcept {
+        return find(sv) != npos;
+    }
+
+    constexpr bool contains(char_type c) const noexcept {
+        return find(c) != npos;
+    }
+
+    constexpr bool contains(const char_type* s) const noexcept {
+        return find(s) != npos;
     }
 
     void swap(basic_sstring& x) noexcept {
@@ -529,10 +668,21 @@ public:
     bool operator!=(const basic_sstring& x) const noexcept {
         return !operator==(x);
     }
+    constexpr bool operator==(const std::basic_string<char_type> x) const noexcept {
+        return compare(x) == 0;
+    }
+    constexpr bool operator==(const char_type* x) const noexcept {
+        return compare(x) == 0;
+    }
+#if __cpp_lib_three_way_comparison
+    constexpr std::strong_ordering operator<=>(const auto& x) const noexcept {
+        return compare(x) <=> 0;
+    }
+#else
     bool operator<(const basic_sstring& x) const noexcept {
         return compare(x) < 0;
     }
-    bool operator<=(const basic_sstring& x) const {
+        bool operator<=(const basic_sstring& x) const {
         return compare(x) <= 0;
     }
     bool operator>(const basic_sstring& x) const {
@@ -541,6 +691,7 @@ public:
     bool operator>=(const basic_sstring& x) const {
         return compare(x) >= 0;
     }
+#endif
     basic_sstring operator+(const basic_sstring& x) const {
         basic_sstring ret(initialized_later(), size() + x.size());
         std::copy(begin(), end(), ret.begin());
@@ -570,23 +721,30 @@ public:
         return std::basic_string_view<char_type>(str(), size());
     }
 };
-template <typename char_type, typename Size, Size max_size, bool NulTerminate>
-constexpr Size basic_sstring<char_type, Size, max_size, NulTerminate>::npos;
 
+namespace internal {
+template <class T> struct is_sstring : std::false_type {};
+template <typename char_type, typename Size, Size max_size, bool NulTerminate>
+struct is_sstring<basic_sstring<char_type, Size, max_size, NulTerminate>> : std::true_type {};
+}
+
+SEASTAR_MODULE_EXPORT
 template <typename string_type = sstring>
 string_type uninitialized_string(size_t size) {
-    string_type ret;
-    // FIXME: use __resize_default_init if available
-    ret.resize(size);
-    return ret;
+    if constexpr (internal::is_sstring<string_type>::value) {
+        return string_type(typename string_type::initialized_later(), size);
+    } else {
+        string_type ret;
+#ifdef __cpp_lib_string_resize_and_overwrite
+        ret.resize_and_overwrite(size, [](typename string_type::value_type*, typename string_type::size_type n) { return n; });
+#else
+        ret.resize(size);
+#endif
+        return ret;
+    }
 }
 
-template <typename char_type, typename Size, Size max_size, bool NulTerminate>
-basic_sstring<char_type, Size, max_size, NulTerminate> uninitialized_string(size_t size) {
-    using sstring_type = basic_sstring<char_type, Size, max_size, NulTerminate>;
-    return sstring_type(sstring_type::initialized_later(), size);
-}
-
+SEASTAR_MODULE_EXPORT
 template <typename char_type, typename size_type, size_type Max, size_type N, bool NulTerminate>
 inline
 basic_sstring<char_type, size_type, Max, NulTerminate>
@@ -599,17 +757,13 @@ operator+(const char(&s)[N], const basic_sstring<char_type, size_type, Max, NulT
     return ret;
 }
 
+template <typename T>
 static inline
-size_t str_len() {
-    return 0;
+size_t constexpr str_len(const T& s) {
+    return std::string_view(s).size();
 }
 
-template <typename First, typename... Tail>
-static inline
-size_t str_len(const First& first, const Tail&... tail) {
-    return std::string_view(first).size() + str_len(tail...);
-}
-
+SEASTAR_MODULE_EXPORT
 template <typename char_type, typename size_type, size_type max_size>
 inline
 void swap(basic_sstring<char_type, size_type, max_size>& x,
@@ -618,6 +772,7 @@ void swap(basic_sstring<char_type, size_type, max_size>& x,
     return x.swap(y);
 }
 
+SEASTAR_MODULE_EXPORT
 template <typename char_type, typename size_type, size_type max_size, bool NulTerminate, typename char_traits>
 inline
 std::basic_ostream<char_type, char_traits>&
@@ -626,6 +781,7 @@ operator<<(std::basic_ostream<char_type, char_traits>& os,
     return os.write(s.begin(), s.size());
 }
 
+SEASTAR_MODULE_EXPORT
 template <typename char_type, typename size_type, size_type max_size, bool NulTerminate, typename char_traits>
 inline
 std::basic_istream<char_type, char_traits>&
@@ -641,6 +797,7 @@ operator>>(std::basic_istream<char_type, char_traits>& is,
 
 namespace std {
 
+SEASTAR_MODULE_EXPORT
 template <typename char_type, typename size_type, size_type max_size, bool NulTerminate>
 struct hash<seastar::basic_sstring<char_type, size_type, max_size, NulTerminate>> {
     size_t operator()(const seastar::basic_sstring<char_type, size_type, max_size, NulTerminate>& s) const {
@@ -652,78 +809,29 @@ struct hash<seastar::basic_sstring<char_type, size_type, max_size, NulTerminate>
 
 namespace seastar {
 
+template <typename T>
 static inline
-char* copy_str_to(char* dst) {
-    return dst;
-}
-
-template <typename Head, typename... Tail>
-static inline
-char* copy_str_to(char* dst, const Head& head, const Tail&... tail) {
-    std::string_view v(head);
-    return copy_str_to(std::copy(v.begin(), v.end(), dst), tail...);
+void copy_str_to(char*& dst, const T& s) {
+    std::string_view v(s);
+    dst = std::copy(v.begin(), v.end(), dst);
 }
 
 template <typename String = sstring, typename... Args>
 static String make_sstring(Args&&... args)
 {
-    String ret = uninitialized_string<String>(str_len(args...));
-    copy_str_to(ret.data(), args...);
+    String ret = uninitialized_string<String>((str_len(args) + ...));
+    auto dst = ret.data();
+    (copy_str_to(dst, args), ...);
     return ret;
 }
 
 namespace internal {
 template <typename string_type, typename T>
-string_type to_sstring_sprintf(T value, const char* fmt) {
-    char tmp[sizeof(value) * 3 + 2];
-    auto len = std::sprintf(tmp, fmt, value);
-    using ch_type = typename string_type::value_type;
-    return string_type(reinterpret_cast<ch_type*>(tmp), len);
-}
-
-template <typename string_type>
-string_type to_sstring(int value) {
-    return to_sstring_sprintf<string_type>(value, "%d");
-}
-
-template <typename string_type>
-string_type to_sstring(unsigned value) {
-    return to_sstring_sprintf<string_type>(value, "%u");
-}
-
-template <typename string_type>
-string_type to_sstring(long value) {
-    return to_sstring_sprintf<string_type>(value, "%ld");
-}
-
-template <typename string_type>
-string_type to_sstring(unsigned long value) {
-    return to_sstring_sprintf<string_type>(value, "%lu");
-}
-
-template <typename string_type>
-string_type to_sstring(long long value) {
-    return to_sstring_sprintf<string_type>(value, "%lld");
-}
-
-template <typename string_type>
-string_type to_sstring(unsigned long long value) {
-    return to_sstring_sprintf<string_type>(value, "%llu");
-}
-
-template <typename string_type>
-string_type to_sstring(float value) {
-    return to_sstring_sprintf<string_type>(value, "%g");
-}
-
-template <typename string_type>
-string_type to_sstring(double value) {
-    return to_sstring_sprintf<string_type>(value, "%g");
-}
-
-template <typename string_type>
-string_type to_sstring(long double value) {
-    return to_sstring_sprintf<string_type>(value, "%Lg");
+string_type to_sstring(T value) {
+    auto size = fmt::formatted_size("{}", value);
+    auto formatted = uninitialized_string<string_type>(size);
+    fmt::format_to(formatted.data(), "{}", value);
+    return formatted;
 }
 
 template <typename string_type>
@@ -748,8 +856,13 @@ string_type to_sstring(T value) {
 }
 }
 
+#ifdef SEASTAR_DEPRECATED_OSTREAM_FORMATTERS
+
 namespace std {
+
+SEASTAR_MODULE_EXPORT
 template <typename T>
+[[deprecated("Use {fmt} instead")]]
 inline
 std::ostream& operator<<(std::ostream& os, const std::vector<T>& v) {
     bool first = true;
@@ -766,7 +879,9 @@ std::ostream& operator<<(std::ostream& os, const std::vector<T>& v) {
     return os;
 }
 
+SEASTAR_MODULE_EXPORT
 template <typename Key, typename T, typename Hash, typename KeyEqual, typename Allocator>
+[[deprecated("Use {fmt} instead")]]
 std::ostream& operator<<(std::ostream& os, const std::unordered_map<Key, T, Hash, KeyEqual, Allocator>& v) {
     bool first = true;
     os << "{";
@@ -776,9 +891,38 @@ std::ostream& operator<<(std::ostream& os, const std::unordered_map<Key, T, Hash
         } else {
             first = false;
         }
-        os << "{ " << elem.first << " -> " << elem.second << "}";
+        os << "{" << elem.first << " -> " << elem.second << "}";
     }
     os << "}";
     return os;
 }
 }
+
+#endif
+
+#if FMT_VERSION >= 110000
+
+template <typename char_type, typename Size, Size max_size, bool NulTerminate>
+struct fmt::range_format_kind<seastar::basic_sstring<char_type, Size, max_size, NulTerminate>, char_type> : std::integral_constant<fmt::range_format, fmt::range_format::disabled>
+{};
+
+#endif
+
+#if FMT_VERSION >= 90000
+
+// Due to https://github.com/llvm/llvm-project/issues/68849, we inherit
+// from formatter<string_view> publicly rather than privately
+
+SEASTAR_MODULE_EXPORT
+template <typename char_type, typename Size, Size max_size, bool NulTerminate>
+struct fmt::formatter<seastar::basic_sstring<char_type, Size, max_size, NulTerminate>>
+    : public fmt::formatter<basic_string_view<char_type>> {
+    using format_as_t = basic_string_view<char_type>;
+    using base = fmt::formatter<format_as_t>;
+    template <typename FormatContext>
+    auto format(const ::seastar::basic_sstring<char_type, Size, max_size, NulTerminate>& s, FormatContext& ctx) const {
+        return base::format(format_as_t{s.c_str(), s.size()}, ctx);
+    }
+};
+
+#endif

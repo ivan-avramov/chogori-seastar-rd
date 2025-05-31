@@ -78,6 +78,11 @@ inline LogEntry StartLogStream() {
     assert((cond)); \
 }
 #else
-#define K2ASSERT(cond, msg)
+#define K2ASSERT(cond, msg) \
+    {                       \
+        if (0) {            \
+            K2ERROR(msg);   \
+        }                   \
+    }
 #endif
 

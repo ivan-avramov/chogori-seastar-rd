@@ -23,9 +23,12 @@
 
 #include <seastar/core/transfer.hh>
 #include <seastar/core/bitops.hh>
-#include <seastar/util/concepts.hh>
+#include <seastar/util/modules.hh>
+#ifndef SEASTAR_MODULE
+#include <concepts>
 #include <memory>
 #include <algorithm>
+#endif
 
 namespace seastar {
 
@@ -55,6 +58,7 @@ namespace seastar {
 ///     * pop_back() will invalidate end().
 ///
 /// reserve() may also invalidate all iterators and references.
+SEASTAR_MODULE_EXPORT
 template <typename T, typename Alloc = std::allocator<T>>
 class circular_buffer {
     struct impl : Alloc {
@@ -84,7 +88,7 @@ public:
     using const_reference = const T&;
     using const_pointer = const T*;
 public:
-    circular_buffer() noexcept SEASTAR_CONCEPT(requires std::default_initializable<Alloc>) : circular_buffer(Alloc()) {}
+    circular_buffer() noexcept requires std::default_initializable<Alloc> : circular_buffer(Alloc()) {}
     circular_buffer(Alloc alloc) noexcept;
     circular_buffer(circular_buffer&& X) noexcept;
     circular_buffer(const circular_buffer& X) = delete;
@@ -105,11 +109,11 @@ public:
     const T& back() const noexcept;
     void pop_front() noexcept;
     void pop_back() noexcept;
-    bool empty() const;
-    size_t size() const;
-    size_t capacity() const;
+    bool empty() const noexcept;
+    size_t size() const noexcept;
+    size_t capacity() const noexcept;
     void reserve(size_t);
-    void clear();
+    void clear() noexcept;
     T& operator[](size_t idx) noexcept;
     const T& operator[](size_t idx) const noexcept;
     template <typename Func>
@@ -124,8 +128,12 @@ private:
     size_t mask(size_t idx) const;
 
     template<typename CB, typename ValueType>
-    struct cbiterator : std::iterator<std::random_access_iterator_tag, ValueType> {
-        typedef std::iterator<std::random_access_iterator_tag, ValueType> super_t;
+    struct cbiterator {
+        using iterator_category = std::random_access_iterator_tag;
+        using value_type = ValueType;
+        using difference_type = std::ptrdiff_t;
+        using pointer = ValueType*;
+        using reference = ValueType&;
 
         ValueType& operator*() const noexcept { return cb->_impl.storage[cb->mask(idx)]; }
         ValueType* operator->() const noexcept { return &cb->_impl.storage[cb->mask(idx)]; }
@@ -135,7 +143,7 @@ private:
             return *this;
         }
         // postfix
-        cbiterator<CB, ValueType> operator++(int unused) noexcept {
+        cbiterator<CB, ValueType> operator++(int) noexcept {
             auto v = *this;
             idx++;
             return v;
@@ -146,22 +154,22 @@ private:
             return *this;
         }
         // postfix
-        cbiterator<CB, ValueType> operator--(int unused) noexcept {
+        cbiterator<CB, ValueType> operator--(int) noexcept {
             auto v = *this;
             idx--;
             return v;
         }
-        cbiterator<CB, ValueType> operator+(typename super_t::difference_type n) const noexcept {
+        cbiterator<CB, ValueType> operator+(difference_type n) const noexcept {
             return cbiterator<CB, ValueType>(cb, idx + n);
         }
-        cbiterator<CB, ValueType> operator-(typename super_t::difference_type n) const noexcept {
+        cbiterator<CB, ValueType> operator-(difference_type n) const noexcept {
             return cbiterator<CB, ValueType>(cb, idx - n);
         }
-        cbiterator<CB, ValueType>& operator+=(typename super_t::difference_type n) noexcept {
+        cbiterator<CB, ValueType>& operator+=(difference_type n) noexcept {
             idx += n;
             return *this;
         }
-        cbiterator<CB, ValueType>& operator-=(typename super_t::difference_type n) noexcept {
+        cbiterator<CB, ValueType>& operator-=(difference_type n) noexcept {
             idx -= n;
             return *this;
         }
@@ -172,23 +180,24 @@ private:
             return idx != rhs.idx;
         }
         bool operator<(const cbiterator<CB, ValueType>& rhs) const noexcept {
-            return idx < rhs.idx;
+            return *this - rhs < 0;
         }
         bool operator>(const cbiterator<CB, ValueType>& rhs) const noexcept {
-            return idx > rhs.idx;
+            return *this - rhs > 0;
         }
         bool operator>=(const cbiterator<CB, ValueType>& rhs) const noexcept {
-            return idx >= rhs.idx;
+            return *this - rhs >= 0;
         }
         bool operator<=(const cbiterator<CB, ValueType>& rhs) const noexcept {
-            return idx <= rhs.idx;
+            return *this - rhs <= 0;
         }
-       typename super_t::difference_type operator-(const cbiterator<CB, ValueType>& rhs) const noexcept {
+       difference_type operator-(const cbiterator<CB, ValueType>& rhs) const noexcept {
             return idx - rhs.idx;
         }
+        cbiterator() = default;
     private:
-        CB* cb;
-        size_t idx;
+        CB* cb{nullptr};
+        size_t idx{0};
         cbiterator(CB* b, size_t i) noexcept : cb(b), idx(i) {}
         friend class circular_buffer;
     };
@@ -229,21 +238,21 @@ circular_buffer<T, Alloc>::mask(size_t idx) const {
 template <typename T, typename Alloc>
 inline
 bool
-circular_buffer<T, Alloc>::empty() const {
+circular_buffer<T, Alloc>::empty() const noexcept {
     return _impl.begin == _impl.end;
 }
 
 template <typename T, typename Alloc>
 inline
 size_t
-circular_buffer<T, Alloc>::size() const {
+circular_buffer<T, Alloc>::size() const noexcept {
     return _impl.end - _impl.begin;
 }
 
 template <typename T, typename Alloc>
 inline
 size_t
-circular_buffer<T, Alloc>::capacity() const {
+circular_buffer<T, Alloc>::capacity() const noexcept {
     return _impl.capacity;
 }
 
@@ -260,7 +269,7 @@ circular_buffer<T, Alloc>::reserve(size_t size) {
 template <typename T, typename Alloc>
 inline
 void
-circular_buffer<T, Alloc>::clear() {
+circular_buffer<T, Alloc>::clear() noexcept {
     erase(begin(), end());
 }
 
@@ -482,7 +491,7 @@ template <typename T, typename Alloc>
 inline
 typename circular_buffer<T, Alloc>::iterator
 circular_buffer<T, Alloc>::erase(iterator first, iterator last) noexcept {
-    static_assert(std::is_nothrow_move_assignable<T>::value, "erase() assumes move assignment does not throw");
+    static_assert(std::is_nothrow_move_assignable_v<T>, "erase() assumes move assignment does not throw");
     if (first == last) {
         return last;
     }
@@ -490,18 +499,15 @@ circular_buffer<T, Alloc>::erase(iterator first, iterator last) noexcept {
     // This also guarantees that iterators will be stable when removing from either front or back.
     if (std::distance(begin(), first) < std::distance(last, end())) {
         auto new_start = std::move_backward(begin(), first, last);
-        auto i = begin();
-        while (i < new_start) {
-            std::allocator_traits<Alloc>::destroy(_impl, &*i++);
+        for (auto i = begin(); i < new_start; ++i) {
+            std::allocator_traits<Alloc>::destroy(_impl, &*i);
         }
         _impl.begin = new_start.idx;
         return last;
     } else {
         auto new_end = std::move(last, end(), first);
-        auto i = new_end;
-        auto e = end();
-        while (i < e) {
-            std::allocator_traits<Alloc>::destroy(_impl, &*i++);
+        for (auto i = new_end, e = end(); i < e; ++i) {
+            std::allocator_traits<Alloc>::destroy(_impl, &*i);
         }
         _impl.end = new_end.idx;
         return first;

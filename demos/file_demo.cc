@@ -36,6 +36,7 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/io_intent.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/tmp_file.hh>
 
@@ -45,9 +46,9 @@ constexpr size_t aligned_size = 4096;
 
 future<> verify_data_file(file& f, temporary_buffer<char>& rbuf, const temporary_buffer<char>& wbuf) {
     return f.dma_read(0, rbuf.get_write(), aligned_size).then([&rbuf, &wbuf] (size_t count) {
-        assert(count == aligned_size);
+        SEASTAR_ASSERT(count == aligned_size);
         fmt::print("    verifying {} bytes\n", count);
-        assert(!memcmp(rbuf.get(), wbuf.get(), aligned_size));
+        SEASTAR_ASSERT(!memcmp(rbuf.get(), wbuf.get(), aligned_size));
     });
 }
 
@@ -55,7 +56,7 @@ future<file> open_data_file(sstring meta_filename, temporary_buffer<char>& rbuf)
     fmt::print("    retrieving data filename from {}\n", meta_filename);
     return with_file(open_file_dma(meta_filename, open_flags::ro), [&rbuf] (file& f) {
         return f.dma_read(0, rbuf.get_write(), aligned_size).then([&rbuf] (size_t count) {
-            assert(count == aligned_size);
+            SEASTAR_ASSERT(count == aligned_size);
             auto data_filename = sstring(rbuf.get());
             fmt::print("    opening {}\n", data_filename);
             return open_file_dma(data_filename, open_flags::ro);
@@ -67,7 +68,7 @@ future<> demo_with_file() {
     fmt::print("Demonstrating with_file():\n");
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         auto rnd = std::mt19937(std::random_device()());
-        auto dist = std::uniform_int_distribution<char>(0, std::numeric_limits<char>::max());
+        auto dist = std::uniform_int_distribution<int>(0, std::numeric_limits<char>::max());
         auto wbuf = temporary_buffer<char>::aligned(aligned_size, aligned_size);
         sstring meta_filename = (t.get_path() / "meta_file").native();
         sstring data_filename = (t.get_path() / "data_file").native();
@@ -76,8 +77,8 @@ future<> demo_with_file() {
         auto write_to_file = [] (const sstring filename, temporary_buffer<char>& wbuf) {
             auto count = with_file(open_file_dma(filename, open_flags::rw | open_flags::create), [&wbuf] (file& f) {
                 return f.dma_write(0, wbuf.get(), aligned_size);
-            }).get0();
-            assert(count == aligned_size);
+            }).get();
+            SEASTAR_ASSERT(count == aligned_size);
         };
 
         // print the data_filename into the write buffer
@@ -109,7 +110,7 @@ future<> demo_with_file_close_on_failure() {
     fmt::print("\nDemonstrating with_file_close_on_failure():\n");
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         auto rnd = std::mt19937(std::random_device()());
-        auto dist = std::uniform_int_distribution<char>(0, std::numeric_limits<char>::max());
+        auto dist = std::uniform_int_distribution<int>(0, std::numeric_limits<char>::max());
         auto wbuf = temporary_buffer<char>::aligned(aligned_size, aligned_size);
         sstring meta_filename = (t.get_path() / "meta_file").native();
         sstring data_filename = (t.get_path() / "data_file").native();
@@ -118,8 +119,8 @@ future<> demo_with_file_close_on_failure() {
         // `make_file_output_stream` returns an error. Otherwise, in the error-free path,
         // the opened file is moved to `file_output_stream` that in-turn closes it
         // when the stream is closed.
-        auto make_output_stream = [] (const sstring filename) {
-            return with_file_close_on_failure(open_file_dma(std::move(filename), open_flags::rw | open_flags::create), [] (file f) {
+        auto make_output_stream = [] (std::string_view filename) {
+            return with_file_close_on_failure(open_file_dma(filename, open_flags::rw | open_flags::create), [] (file f) {
                 return make_file_output_stream(std::move(f), aligned_size);
             });
         };
@@ -144,7 +145,7 @@ future<> demo_with_file_close_on_failure() {
         // `make_file_output_stream` returns an error. Otherwise, in the error-free path,
         // the opened file is moved to `file_output_stream` that in-turn closes it
         // when the stream is closed.
-        output_stream<char> o = make_output_stream(meta_filename).get0();
+        output_stream<char> o = make_output_stream(meta_filename).get();
 
         write_to_stream(o, wbuf).get();
 
@@ -152,7 +153,7 @@ future<> demo_with_file_close_on_failure() {
         fmt::print("  writing random data into {}\n", data_filename);
         std::generate(wbuf.get_write(), wbuf.get_write() + aligned_size, [&dist, &rnd] { return dist(rnd); });
 
-        o = make_output_stream(data_filename).get0();
+        o = make_output_stream(data_filename).get();
 
         write_to_stream(o, wbuf).get();
 
@@ -172,10 +173,10 @@ future<> demo_with_io_intent() {
     fmt::print("\nDemonstrating demo_with_io_intent():\n");
     return tmp_dir::do_with_thread([] (tmp_dir& t) {
         sstring filename = (t.get_path() / "testfile.tmp").native();
-        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get0();
+        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get();
 
         auto rnd = std::mt19937(std::random_device()());
-        auto dist = std::uniform_int_distribution<char>(0, std::numeric_limits<char>::max());
+        auto dist = std::uniform_int_distribution<int>(0, std::numeric_limits<char>::max());
 
         auto wbuf = temporary_buffer<char>::aligned(aligned_size, aligned_size);
         fmt::print("  writing random data into {}\n", filename);
@@ -189,7 +190,7 @@ future<> demo_with_io_intent() {
 
         io_intent intent;
         auto f1 = f.dma_write(0, wbuf_n.get(), half_aligned_size);
-        auto f2 = f.dma_write(half_aligned_size, wbuf_n.get() + half_aligned_size, half_aligned_size, default_priority_class(), &intent);
+        auto f2 = f.dma_write(half_aligned_size, wbuf_n.get() + half_aligned_size, half_aligned_size, &intent);
 
         fmt::print("  cancel the 2nd overwriting\n");
         intent.cancel();
@@ -213,14 +214,14 @@ future<> demo_with_io_intent() {
         f.dma_read(0, rbuf.get(), aligned_size).get();
 
         // First part of the buffer must coincide with the overwritten data
-        assert(!memcmp(rbuf.get(), wbuf_n.get(), half_aligned_size));
+        SEASTAR_ASSERT(!memcmp(rbuf.get(), wbuf_n.get(), half_aligned_size));
 
         if (cancelled) {
             // Second part -- with the old data ...
-            assert(!memcmp(rbuf.get() + half_aligned_size, wbuf.get() + half_aligned_size, half_aligned_size));
+            SEASTAR_ASSERT(!memcmp(rbuf.get() + half_aligned_size, wbuf.get() + half_aligned_size, half_aligned_size));
         } else {
             // ... or with new if the cancellation didn't happen
-            assert(!memcmp(rbuf.get() + half_aligned_size, wbuf.get() + half_aligned_size, half_aligned_size));
+            SEASTAR_ASSERT(!memcmp(rbuf.get() + half_aligned_size, wbuf.get() + half_aligned_size, half_aligned_size));
         }
     });
 }

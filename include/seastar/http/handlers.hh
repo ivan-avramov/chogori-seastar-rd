@@ -23,24 +23,29 @@
 
 #include <seastar/http/request.hh>
 #include <seastar/http/common.hh>
+#include <seastar/http/exception.hh>
 #include <seastar/http/reply.hh>
 
-#include <unordered_map>
 
 namespace seastar {
 
 namespace httpd {
 
-typedef const httpd::request& const_req;
+typedef const http::request& const_req;
 
 /**
  * handlers holds the logic for serving an incoming request.
- * All handlers inherit from the base httpserver_handler and
+ * All handlers inherit from the base handler_base and
  * implement the handle method.
  *
  */
 class handler_base {
+    std::vector<sstring> _mandatory_param;
+protected:
+    handler_base() = default;
+    handler_base(const handler_base&) = default;
 public:
+    virtual ~handler_base() = default;
     /**
      * All handlers should implement this method.
      *  It fill the reply according to the request.
@@ -48,10 +53,9 @@ public:
      * @param req the original request
      * @param rep the reply
      */
-    virtual future<std::unique_ptr<reply> > handle(const sstring& path,
-            std::unique_ptr<request> req, std::unique_ptr<reply> rep) = 0;
+    virtual future<std::unique_ptr<http::reply> > handle(const sstring& path,
+            std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) = 0;
 
-    virtual ~handler_base() = default;
 
     /**
      * Add a mandatory parameter
@@ -63,8 +67,18 @@ public:
         return *this;
     }
 
-    std::vector<sstring> _mandatory_param;
-
+    /**
+     * Check if all mandatory parameters exist in the request. if any param
+     * does not exist, the function would throw a @c missing_param_exception
+     * @param params req the http request
+     */
+    void verify_mandatory_params(const http::request& req) const {
+        for (auto& param : _mandatory_param) {
+            if (req.get_query_param(param) == "") {
+                throw missing_param_exception(param);
+            }
+        }
+    }
 };
 
 }

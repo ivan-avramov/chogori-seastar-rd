@@ -11,10 +11,11 @@
 #pragma once
 
 #include <seastar/core/sstring.hh>
+#include <seastar/util/modules.hh>
 
 namespace seastar {
 
-namespace httpd {
+namespace http {
 
 namespace mime_types {
 
@@ -24,10 +25,20 @@ namespace mime_types {
  * @param extension the file extension
  * @return the mime type as a string
  */
+SEASTAR_MODULE_EXPORT
 const char* extension_to_type(const sstring& extension);
 
 } // namespace mime_types
 
 } // namespace httpd
+
+namespace httpd {
+namespace mime_types {
+[[deprecated("Use http::mime_types::extension_to_type instead")]]
+inline const char* extension_to_type(const sstring& extension) {
+    return http::mime_types::extension_to_type(extension);
+}
+}
+}
 
 }

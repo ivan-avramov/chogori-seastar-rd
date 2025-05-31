@@ -30,6 +30,7 @@
 #include <seastar/net/ethernet.hh>
 #include <seastar/net/packet.hh>
 #include <seastar/net/const.hh>
+#include <seastar/util/assert.hh>
 #include <unordered_map>
 
 namespace seastar {
@@ -56,7 +57,7 @@ public:
         return end_idx;
     }
     void push_back(uint8_t b) {
-        assert(end_idx < sizeof(data));
+        SEASTAR_ASSERT(end_idx < sizeof(data));
         data[end_idx++] = b;
     }
     void push_back(uint16_t b) {
@@ -127,7 +128,7 @@ private:
     future<> dispatch_packet(packet p);
 public:
     explicit interface(std::shared_ptr<device> dev);
-    ethernet_address hw_address() { return _hw_address; }
+    ethernet_address hw_address() const noexcept { return _hw_address; }
     const net::hw_features& hw_features() const { return _hw_features; }
     future<> register_l3(eth_protocol_num proto_num,
             std::function<future<> (packet p, ethernet_address from)> next,
@@ -281,7 +282,7 @@ public:
     virtual rss_key_type rss_key() const { return default_rsskey_40bytes; }
     virtual uint16_t hw_queues_count() { return 1; }
     virtual future<> link_ready() { return make_ready_future<>(); }
-    virtual std::unique_ptr<qp> init_local_queue(boost::program_options::variables_map opts, uint16_t qid) = 0;
+    virtual std::unique_ptr<qp> init_local_queue(const program_options::option_group& opts, uint16_t qid) = 0;
     virtual unsigned hash2qid(uint32_t hash) {
         return hash % hw_queues_count();
     }
@@ -303,13 +304,6 @@ public:
     }
 };
 
-// The max data size we can fit in a packet
-inline constexpr uint16_t tcpsegsize() {
-    return seastar::net::hw_features().mtu
-                - seastar::net::tcp_hdr_len_min
-                - seastar::net::ipv4_hdr_len_min
-                - seastar::net::eth_hdr_len;
-}
 }
 
 }

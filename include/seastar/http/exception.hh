@@ -20,13 +20,17 @@
  */
 
 #pragma once
+
 #include <seastar/util/log.hh>
+#include <seastar/util/modules.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/json/json_elements.hh>
 
 namespace seastar {
 
 namespace httpd {
+
+SEASTAR_MODULE_EXPORT_BEGIN
 
 /**
  * The base_exception is a base for all http exception.
@@ -35,15 +39,15 @@ namespace httpd {
  */
 class base_exception : public std::exception {
 public:
-    base_exception(const std::string& msg, reply::status_type status)
+    base_exception(const std::string& msg, http::reply::status_type status)
             : _msg(msg), _status(status) {
     }
 
-    virtual const char* what() const throw () {
+    virtual const char* what() const noexcept {
         return _msg.c_str();
     }
 
-    reply::status_type status() const {
+    http::reply::status_type status() const {
         return _status;
     }
 
@@ -52,7 +56,7 @@ public:
     }
 private:
     std::string _msg;
-    reply::status_type _status;
+    http::reply::status_type _status;
 
 };
 
@@ -61,9 +65,8 @@ private:
  */
 class redirect_exception : public base_exception {
 public:
-    redirect_exception(const std::string& url)
-            : base_exception("", reply::status_type::moved_permanently), url(
-                    url) {
+    redirect_exception(const std::string& url, http::reply::status_type status = http::reply::status_type::moved_permanently)
+            : base_exception("", status), url(url) {
     }
     std::string url;
 };
@@ -74,7 +77,7 @@ public:
 class not_found_exception : public base_exception {
 public:
     not_found_exception(const std::string& msg = "Not found")
-            : base_exception(msg, reply::status_type::not_found) {
+            : base_exception(msg, http::reply::status_type::not_found) {
     }
 };
 
@@ -85,7 +88,7 @@ public:
 class bad_request_exception : public base_exception {
 public:
     bad_request_exception(const std::string& msg)
-            : base_exception(msg, reply::status_type::bad_request) {
+            : base_exception(msg, http::reply::status_type::bad_request) {
     }
 };
 
@@ -104,11 +107,24 @@ public:
     }
 };
 
+class bad_chunk_exception : public bad_request_exception {
+public:
+    bad_chunk_exception(const std::string& msg)
+            : bad_request_exception(
+                    std::string("Can't read body chunk in a 'chunked' request '") + msg + "'") {
+    }
+};
+
 class server_error_exception : public base_exception {
 public:
     server_error_exception(const std::string& msg)
-            : base_exception(msg, reply::status_type::internal_server_error) {
+            : base_exception(msg, http::reply::status_type::internal_server_error) {
     }
+};
+
+class response_parsing_exception : public server_error_exception {
+public:
+    explicit response_parsing_exception(const std::string& msg) : server_error_exception(msg) {}
 };
 
 class json_exception : public json::json_base {
@@ -125,18 +141,38 @@ public:
     }
 
     json_exception(std::exception_ptr e) {
-	std::ostringstream exception_description;
-	exception_description << e;
-	set(exception_description.str(), reply::status_type::internal_server_error);
+        std::ostringstream exception_description;
+        exception_description << e;
+        set(exception_description.str(), http::reply::status_type::internal_server_error);
     }
 private:
-    void set(const std::string& msg, reply::status_type code) {
+    void set(const std::string& msg, http::reply::status_type code) {
         register_params();
         _msg = msg;
         _code = (int) code;
     }
 };
 
+/**
+ * Client-side exception to report unexpected server reply status
+ */
+class unexpected_status_error : public base_exception {
+public:
+    unexpected_status_error(http::reply::status_type st)
+        : base_exception(fmt::to_string(st), st)
+    {}
+};
+
+SEASTAR_MODULE_EXPORT_END
 }
 
 }
+
+SEASTAR_MODULE_EXPORT
+template <>
+struct fmt::formatter<seastar::httpd::base_exception> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const seastar::httpd::base_exception& e, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{} ({})", e.what(), e.status());
+    }
+};

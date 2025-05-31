@@ -64,7 +64,7 @@ where OPTIONS are:
 -l
 -h
 
-By default, cmake-cooking reads a file called `cooking_recipe.cmake`.
+By default, cmake-cooking reads a file called 'cooking_recipe.cmake'.
 
 If neither [-i] nor [-e] are specified with a recipe ([-r]), then all ingredients of the recipe
 will be fetched and built.
@@ -80,7 +80,7 @@ Option details:
 
 -r RECIPE
 
-    Instead of reading the recipe in a file called `cooking_recipe.cmake`, follow the recipe
+    Instead of reading the recipe in a file called 'cooking_recipe.cmake', follow the recipe
     in the named file.
 
     If the recipe file is a relative path, it is interpretted relative to the source directory
@@ -162,8 +162,10 @@ EOF
 }
 
 parse_assignment() {
-    IFS='=' read -ra parts <<< "${1}"
-    export "${parts[0]}"="${parts[1]}"
+    local var
+    local value
+    IFS='=' read -r var value <<< "${1}"
+    export "${var}"="${value}"
 }
 
 yell_include_exclude_mutually_exclusive() {
@@ -558,10 +560,24 @@ endfunction ()
 function (_cooking_determine_common_cmake_args output)
   string (REPLACE ";" ":::" prefix_path_with_colons "${CMAKE_PREFIX_PATH}")
 
-  set (${output}
+  set (cmake_args "-G" "${CMAKE_GENERATOR}")
+
+  if (CMAKE_CXX_FLAGS)
+    list(APPEND cmake_args -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS})
+  endif ()
+  if (CMAKE_C_FLAGS)
+    list(APPEND cmake_args -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS})
+  endif ()
+
+  list (APPEND cmake_args
     -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
     -DCMAKE_PREFIX_PATH=${prefix_path_with_colons}
     -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+    -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS})
+
+  set (${output} ${cmake_args}
     PARENT_SCOPE)
 endfunction ()
 

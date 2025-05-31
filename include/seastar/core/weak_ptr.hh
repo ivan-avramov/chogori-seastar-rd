@@ -21,7 +21,11 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
+#include <utility>
 #include <boost/intrusive/list.hpp>
+#include <seastar/util/modules.hh>
+#endif
 
 namespace seastar {
 
@@ -37,16 +41,38 @@ namespace seastar {
 /// the to-be-referenced object.
 ///
 /// \see weakly_referencable
+SEASTAR_MODULE_EXPORT
 template<typename T>
 class weak_ptr {
     template<typename U>
     friend class weakly_referencable;
+    template <typename U>
+    friend class weak_ptr;
 private:
     using hook_type = boost::intrusive::list_member_hook<boost::intrusive::link_mode<boost::intrusive::auto_unlink>>;
     hook_type _hook;
     T* _ptr = nullptr;
     weak_ptr(T* p) noexcept : _ptr(p) {}
+    void clear() noexcept {
+        _hook = {};
+        _ptr = nullptr;
+    }
+    void swap(weak_ptr&& o) noexcept {
+        _hook.swap_nodes(o._hook);
+        std::swap(_ptr, o._ptr);
+    }
+
 public:
+    template <typename U>
+    requires std::convertible_to<U*, T*>
+    weak_ptr(weak_ptr<U>&& o)
+    {
+        if (o._ptr) {
+            _ptr = std::exchange(o._ptr, nullptr);
+            _hook.swap_nodes(o._hook);
+        }
+    }
+
     // Note: The default constructor's body is implemented as no-op
     // rather than `noexcept = default` due to a bug with gcc 9.3.1
     // that deletes the constructor since boost::intrusive::list_member_hook
@@ -54,15 +80,27 @@ public:
     weak_ptr() noexcept {}
     weak_ptr(std::nullptr_t) noexcept : weak_ptr() {}
     weak_ptr(weak_ptr&& o) noexcept
-        : _ptr(o._ptr)
     {
-        _hook.swap_nodes(o._hook);
-        o._ptr = nullptr;
+        swap(std::move(o));
+    }
+    weak_ptr(const weak_ptr& o) noexcept {
+        if (o._ptr) {
+            swap(o._ptr->weak_from_this());
+        }
     }
     weak_ptr& operator=(weak_ptr&& o) noexcept {
         if (this != &o) {
-            this->~weak_ptr();
-            new (this) weak_ptr(std::move(o));
+            clear();
+            swap(std::move(o));
+        }
+        return *this;
+    }
+    weak_ptr& operator=(const weak_ptr& o) noexcept {
+        if (this != &o) {
+            clear();
+            if (o._ptr) {
+                swap(o._ptr->weak_from_this());
+            }
         }
         return *this;
     }
@@ -110,9 +148,21 @@ public:
         });
     }
     weak_ptr<T> weak_from_this() noexcept {
+// Suppress -Wdangling-pointer only for this scope
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
         weak_ptr<T> ptr(static_cast<T*>(this));
         _ptr_list.push_back(ptr);
         return ptr;
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
+    }
+
+    weak_ptr<const T> weak_from_this() const noexcept {
+        return const_cast<weakly_referencable*>(this)->weak_from_this();
     }
 };
 

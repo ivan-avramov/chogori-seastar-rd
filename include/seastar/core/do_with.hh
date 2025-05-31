@@ -21,10 +21,13 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <seastar/core/future.hh>
+#include <seastar/util/modules.hh>
 #include <utility>
 #include <memory>
 #include <tuple>
+#endif
 
 namespace seastar {
 
@@ -98,10 +101,13 @@ do_with_impl(T1&& rv1, T2&& rv2, More&&... more) {
         return fut;
     }
     auto ret = task->get_future();
-    internal::set_callback(fut, task.release());
+    internal::set_callback(std::move(fut), task.release());
     return ret;
 }
 }
+
+
+SEASTAR_MODULE_EXPORT_BEGIN
 
 /// \addtogroup future-util
 /// @{
@@ -149,5 +155,7 @@ auto with_lock(Lock& lock, Func&& func) {
 }
 
 /// @}
+
+SEASTAR_MODULE_EXPORT_END
 
 }

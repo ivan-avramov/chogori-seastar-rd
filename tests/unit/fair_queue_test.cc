@@ -21,6 +21,7 @@
  */
 
 #include <seastar/core/thread.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/testing/test_runner.hh>
@@ -28,6 +29,7 @@
 #include <seastar/core/fair_queue.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/util/later.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/print.hh>
 #include <boost/range/irange.hpp>
@@ -42,8 +44,8 @@ struct request {
     unsigned index;
 
     template <typename Func>
-    request(unsigned weight, unsigned index, Func&& h)
-        : fqent(fair_queue_ticket(weight, 0))
+    request(fair_queue_entry::capacity_t cap, unsigned index, Func&& h)
+        : fqent(cap)
         , handle(std::move(h))
         , index(index)
     {}
@@ -59,17 +61,36 @@ class test_env {
     fair_queue _fq;
     std::vector<int> _results;
     std::vector<std::vector<std::exception_ptr>> _exceptions;
-    std::vector<priority_class_ptr> _classes;
+    fair_queue::class_id _nr_classes = 0;
     std::vector<request> _inflight;
+
+    static fair_group::config fg_config(unsigned cap) {
+        fair_group::config cfg;
+        cfg.rate_limit_duration = std::chrono::microseconds(cap);
+        return cfg;
+    }
+
+    static fair_queue::config fq_config() {
+        fair_queue::config cfg;
+        cfg.tau = std::chrono::microseconds(50);
+        return cfg;
+    }
 
     void drain() {
         do {} while (tick() != 0);
     }
 public:
     test_env(unsigned capacity)
-        : _fg(fair_group::config(capacity, std::numeric_limits<int>::max()))
-        , _fq(_fg, fair_queue::config())
-    {}
+        : _fg(fg_config(capacity), 1)
+        , _fq(_fg, fq_config())
+    {
+        // Move _fg._replenished_ts() to far future.
+        // This will prevent any `maybe_replenish_capacity` calls (indirectly done by `fair_queue::dispatch_requests()`)
+        // from replenishing tokens on its own, and ensure that the only source of replenishment will be tick().
+        //
+        // Otherwise the rate of replenishment might be greater than expected by the test, breaking the results.
+        _fg.replenish_capacity(fair_group::clock_type::now() + std::chrono::days(1));
+    }
 
     // As long as there is a request sitting in the queue, tick() will process
     // at least one request. The only situation in which tick() will return nothing
@@ -80,6 +101,7 @@ public:
     // before the queue is destroyed.
     unsigned tick(unsigned n = 1) {
         unsigned processed = 0;
+        _fg.replenish_capacity(_fg.replenished_ts() + std::chrono::microseconds(1));
         _fq.dispatch_requests([] (fair_queue_entry& ent) {
             boost::intrusive::get_parent_from_member(&ent, &request::fqent)->submit();
         });
@@ -91,9 +113,10 @@ public:
             for (auto& req : curr) {
                 processed++;
                 _results[req.index]++;
-                _fq.notify_requests_finished(req.fqent.ticket());
+                _fq.notify_request_finished(req.fqent.capacity());
             }
 
+            _fg.replenish_capacity(_fg.replenished_ts() + std::chrono::microseconds(1));
             _fq.dispatch_requests([] (fair_queue_entry& ent) {
                 boost::intrusive::get_parent_from_member(&ent, &request::fqent)->submit();
             });
@@ -103,37 +126,37 @@ public:
 
     ~test_env() {
         drain();
-        for (auto& p: _classes) {
-            _fq.unregister_priority_class(p);
+        for (fair_queue::class_id id = 0; id < _nr_classes; id++) {
+            _fq.unregister_priority_class(id);
         }
     }
 
     size_t register_priority_class(uint32_t shares) {
         _results.push_back(0);
         _exceptions.push_back(std::vector<std::exception_ptr>());
-        _classes.push_back(_fq.register_priority_class(shares));
-        return _classes.size() - 1;
+        _fq.register_priority_class(_nr_classes, shares);
+        return _nr_classes++;
     }
 
-    void do_op(unsigned index, unsigned weight) {
-        auto cl = _classes[index];
-        auto req = std::make_unique<request>(weight, index, [this, index] (request& req) mutable noexcept {
+    void do_op(fair_queue::class_id id, unsigned weight) {
+        unsigned index = id;
+        auto cap = _fq.tokens_capacity(double(weight) / 1'000'000);
+        auto req = std::make_unique<request>(cap, index, [this, index] (request& req) mutable noexcept {
             try {
                 _inflight.push_back(std::move(req));
             } catch (...) {
                 auto eptr = std::current_exception();
                 _exceptions[index].push_back(eptr);
-                _fq.notify_requests_finished(req.fqent.ticket());
+                _fq.notify_request_finished(req.fqent.capacity());
             }
         });
 
-        _fq.queue(cl, req->fqent);
+        _fq.queue(id, req->fqent);
         req.release();
     }
 
-    void update_shares(unsigned index, uint32_t shares) {
-        auto cl = _classes[index];
-        cl->update_shares(shares);
+    void update_shares(fair_queue::class_id id, uint32_t shares) {
+        _fq.update_shares_for_class(id, shares);
     }
 
     void reset_results(unsigned index) {
@@ -147,7 +170,7 @@ public:
     //
     // The ratios argument is the ratios towards the first class
     void verify(sstring name, std::vector<unsigned> ratios, unsigned expected_error = 1) {
-        assert(ratios.size() == _results.size());
+        SEASTAR_ASSERT(ratios.size() == _results.size());
         auto str = name + ":";
         for (auto i = 0ul; i < _results.size(); ++i) {
             str += format(" r[{:d}] = {:d}", i, _results[i]);
@@ -175,7 +198,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_equal_2classes) {
         env.do_op(b, 1);
     }
 
-    later().get();
+    yield().get();
     // allow half the requests in
     env.tick(100);
     env.verify("equal_2classes", {1, 1});
@@ -196,7 +219,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_equal_4classes) {
         env.do_op(c, 1);
         env.do_op(d, 1);
     }
-    later().get();
+    yield().get();
     // allow half the requests in
     env.tick(200);
     env.verify("equal_4classes", {1, 1, 1, 1});
@@ -213,7 +236,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_different_shares) {
         env.do_op(a, 1);
         env.do_op(b, 1);
     }
-    later().get();
+    yield().get();
     // allow half the requests in
     env.tick(100);
     return env.verify("different_shares", {1, 2});
@@ -233,7 +256,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_equal_hi_capacity_2classes) {
         env.do_op(a, 1);
         env.do_op(b, 1);
     }
-    later().get();
+    yield().get();
 
     // queue has capacity 10, 10 x 10 = 100, allow half the requests in
     env.tick(10);
@@ -255,7 +278,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_different_shares_hi_capacity) {
         env.do_op(a, 1);
         env.do_op(b, 1);
     }
-    later().get();
+    yield().get();
     // queue has capacity 10, 10 x 10 = 100, allow half the requests in
     env.tick(10);
     env.verify("different_shares_hi_capacity", {1, 2});
@@ -272,7 +295,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_different_weights) {
         env.do_op(a, 2);
         env.do_op(b, 1);
     }
-    later().get();
+    yield().get();
     // allow half the requests in
     env.tick(100);
     env.verify("different_weights", {1, 2});
@@ -288,7 +311,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_dominant_queue) {
     for (int i = 0; i < 100; ++i) {
         env.do_op(b, 1);
     }
-    later().get();
+    yield().get();
 
     // consume all requests
     env.tick(100);
@@ -303,31 +326,37 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_dominant_queue) {
     env.verify("dominant_queue", {1, 0});
 }
 
-// Class2 pushes many requests at first. After enough time, this shouldn't matter anymore.
+// Class2 pushes many requests at first. Right after, don't expect Class1 to be able to do the same
 SEASTAR_THREAD_TEST_CASE(test_fair_queue_forgiving_queue) {
     test_env env(1);
+
+    // The fair_queue preemption logic allows one class to gain exclusive
+    // queue access for at most tau duration. Test queue configures the
+    // request rate to be 1/us and tau to be 50us, so after (re-)activation
+    // a queue can overrun its peer by at most 50 requests.
 
     auto a = env.register_priority_class(10);
     auto b = env.register_priority_class(10);
 
     for (int i = 0; i < 100; ++i) {
-        env.do_op(b, 1);
+        env.do_op(a, 1);
     }
-    later().get();
+    yield().get();
 
     // consume all requests
     env.tick(100);
-    sleep(500ms).get();
-    env.reset_results(b);
+    env.reset_results(a);
+
     for (int i = 0; i < 100; ++i) {
         env.do_op(a, 1);
         env.do_op(b, 1);
     }
-    later().get();
+    yield().get();
 
     // allow half the requests in
     env.tick(100);
-    env.verify("forgiving_queue", {1, 1});
+    // 50 requests should be passed from b, other 100 should be shared 1:1
+    env.verify("forgiving_queue", {1, 3}, 2);
 }
 
 // Classes push requests and then update swap their shares. In the end, should have executed
@@ -343,13 +372,13 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_update_shares) {
         env.do_op(b, 1);
     }
 
-    later().get();
+    yield().get();
     // allow 25% of the requests in
     env.tick(250);
     env.update_shares(a, 10);
     env.update_shares(b, 20);
 
-    later().get();
+    yield().get();
     // allow 25% of the requests in
     env.tick(250);
     env.verify("update_shares", {1, 1}, 2);
@@ -393,7 +422,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_longer_run_different_shares) {
     // long period of time, ticking slowly
     for (int i = 0; i < 1000; ++i) {
         sleep(1ms).get();
-        env.tick(2);
+        env.tick(3);
     }
     env.verify("longer_run_different_shares", {1, 2}, 2);
 }
@@ -418,7 +447,7 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_random_run) {
         env.do_op(b, 1);
     }
 
-    later().get();
+    yield().get();
     // In total allow half the requests in
     env.tick(reqs);
 

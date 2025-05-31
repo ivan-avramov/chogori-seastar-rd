@@ -22,8 +22,15 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <seastar/core/future.hh>
-#include <seastar/core/expiring_fifo.hh>
+#include <seastar/core/abortable_fifo.hh>
+#include <seastar/core/abort_on_expiry.hh>
+#include <seastar/core/timed_out_error.hh>
+#include <seastar/util/modules.hh>
+#include <exception>
+#include <optional>
+#endif
 
 namespace seastar {
 
@@ -39,24 +46,28 @@ struct with_clock {};
 template <typename... T>
 struct future_option_traits;
 
-template <typename Clock, typename... T>
-struct future_option_traits<with_clock<Clock>, T...> {
+template <typename Clock, typename T>
+struct future_option_traits<with_clock<Clock>, T> {
     using clock_type = Clock;
 
-    template<template <typename...> class Class>
-    struct parametrize {
-        using type = Class<T...>;
-    };
+    using future_type = future<T>;
+    using promise_type = promise<T>;
 };
 
-template <typename... T>
-struct future_option_traits {
-    using clock_type = lowres_clock;
+template <typename Clock>
+struct future_option_traits<with_clock<Clock>> {
+    using clock_type = Clock;
 
-    template<template <typename...> class Class>
-    struct parametrize {
-        using type = Class<T...>;
-    };
+    using future_type = future<>;
+    using promise_type = promise<>;
+};
+
+template <typename T>
+struct future_option_traits<T> : public future_option_traits<with_clock<lowres_clock>, T> {
+};
+
+template <>
+struct future_option_traits<> : future_option_traits<void> {
 };
 
 /// \endcond
@@ -100,16 +111,31 @@ class shared_future {
 public:
     using clock = typename options::clock_type;
     using time_point = typename clock::time_point;
-    using future_type = typename future_option_traits<T...>::template parametrize<future>::type;
-    using promise_type = typename future_option_traits<T...>::template parametrize<promise>::type;
-    using value_tuple_type = typename future_option_traits<T...>::template parametrize<std::tuple>::type;
+    using future_type = typename future_option_traits<T...>::future_type;
+    using promise_type = typename future_option_traits<T...>::promise_type;
+    using value_tuple_type = typename future_type::tuple_type;
 private:
-    using promise_expiry = typename future_option_traits<T...>::template parametrize<promise_expiry>::type;
-
     /// \cond internal
-    class shared_state : public enable_lw_shared_from_this<shared_state> {
+    class shared_state final : public enable_lw_shared_from_this<shared_state>, public task {
         future_type _original_future;
-        expiring_fifo<promise_type, promise_expiry, clock> _peers;
+        // Ensures that shared_state is alive until run_and_dispose() runs (if the task was scheduled)
+        lw_shared_ptr<shared_state> _keepaliver;
+        struct entry {
+            promise_type pr;
+            std::optional<abort_on_expiry<clock>> timer;
+        };
+
+        struct entry_expiry {
+            void operator()(entry& e) noexcept {
+                if (e.timer) {
+                    e.pr.set_exception(std::make_exception_ptr(timed_out_error()));
+                } else {
+                    e.pr.set_exception(std::make_exception_ptr(abort_requested_exception()));
+                }
+            };
+        };
+
+        internal::abortable_fifo<entry, entry_expiry> _peers;
 
     public:
         ~shared_state() {
@@ -120,18 +146,20 @@ private:
                 _original_future.ignore_ready_future();
             }
         }
-        explicit shared_state(future_type f) noexcept : _original_future(std::move(f)) { }
-        void resolve(future_type&& f) noexcept {
-            _original_future = std::move(f);
+        explicit shared_state(future_type f) noexcept
+                : task(default_scheduling_group()) // SG is set later, when the task is scheduled
+                , _original_future(std::move(f)) {
+        }
+        void run_and_dispose() noexcept override {
             auto& state = _original_future._state;
             if (_original_future.failed()) {
                 while (_peers) {
-                    _peers.front().set_exception(state.get_exception());
+                    _peers.front().pr.set_exception(state.get_exception());
                     _peers.pop_front();
                 }
             } else {
                 while (_peers) {
-                    auto& p = _peers.front();
+                    auto& p = _peers.front().pr;
                     try {
                         p.set_value(state.get_value());
                     } catch (...) {
@@ -140,6 +168,14 @@ private:
                     _peers.pop_front();
                 }
             }
+            // _peer is now empty, but let's also make sure it releases any
+            // memory it might hold in reserve.
+            _peers = {};
+            _keepaliver.release();
+        }
+
+        task* waiting_task() noexcept override {
+            return nullptr;
         }
 
         future_type get_future(time_point timeout = time_point::max()) noexcept {
@@ -151,15 +187,45 @@ private:
             // failing to perform `get_future` itself.
             memory::scoped_critical_alloc_section _;
             if (!_original_future.available()) {
-                promise_type p;
-                auto f = p.get_future();
-                if (_original_future._state.valid()) {
-                    // _original_future's result is forwarded to each peer.
-                    (void)_original_future.then_wrapped([s = this->shared_from_this()] (future_type&& f) mutable {
-                        s->resolve(std::move(f));
-                    });
+                entry& e = _peers.emplace_back();
+
+                auto f = e.pr.get_future();
+                if (timeout != time_point::max()) {
+                    e.timer.emplace(timeout);
+                    abort_source& as = e.timer->abort_source();
+                   _peers.make_back_abortable(as);
                 }
-                _peers.push_back(std::move(p), timeout);
+                if (!_keepaliver) {
+                    this->set_scheduling_group(current_scheduling_group());
+                    _original_future.set_task(*this);
+                    _keepaliver = this->shared_from_this();
+                }
+                return f;
+            } else if (_original_future.failed()) {
+                return future_type(exception_future_marker(), std::exception_ptr(_original_future._state.get_exception()));
+            } else {
+                return future_type(ready_future_marker(), _original_future._state.get_value());
+            }
+        }
+
+        future_type get_future(abort_source& as) noexcept {
+            // Note that some functions called below may throw,
+            // like pushing to _peers or copying _original_future's ready value.
+            // We'd rather terminate than propagate these errors similar to
+            // .then()'s failure to allocate a continuation as the caller cannot
+            // distinguish between an error returned by the original future to
+            // failing to perform `get_future` itself.
+            memory::scoped_critical_alloc_section _;
+            if (!_original_future.available()) {
+                entry& e = _peers.emplace_back();
+
+                auto f = e.pr.get_future();
+                _peers.make_back_abortable(as);
+                if (!_keepaliver) {
+                    this->set_scheduling_group(current_scheduling_group());
+                    _original_future.set_task(*this);
+                    _keepaliver = this->shared_from_this();
+                }
                 return f;
             } else if (_original_future.failed()) {
                 return future_type(exception_future_marker(), std::exception_ptr(_original_future._state.get_exception()));
@@ -174,6 +240,11 @@ private:
 
         bool failed() const noexcept {
             return _original_future.failed();
+        }
+
+        // Used only in tests (see shared_future_tester in futures_test.cc)
+        bool has_scheduled_task() const noexcept {
+            return _keepaliver != nullptr;
         }
     };
     /// \endcond
@@ -199,6 +270,16 @@ public:
         return _state->get_future(timeout);
     }
 
+    /// \brief Creates a new \c future which will resolve with the result of this shared_future
+    ///
+    /// \param as abort source. The returned future will resolve with \ref abort_requested_exception
+    /// if this shared_future doesn't resolve before aborted.
+    ///
+    /// This object must be in a valid state.
+    future_type get_future(abort_source& as) const noexcept {
+        return _state->get_future(as);
+    }
+
     /// \brief Returns true if the future is available (ready or failed)
     ///
     /// \note This object must be in a valid state.
@@ -222,6 +303,10 @@ public:
     bool valid() const noexcept {
         return bool(_state);
     }
+
+    /// \cond internal
+    friend class shared_future_tester;
+    /// \endcond
 };
 
 /// \brief Like \ref promise except that its counterpart is \ref shared_future instead of \ref future
@@ -229,6 +314,7 @@ public:
 /// When the shared_promise is made ready, every waiter is also made ready.
 ///
 /// Like the shared_future, the types in the parameter pack T must all be copy-constructible.
+SEASTAR_MODULE_EXPORT
 template <typename... T>
 class shared_promise {
 public:
@@ -254,6 +340,14 @@ public:
     /// This instance doesn't have to be kept alive until the returned future resolves.
     future_type get_shared_future(time_point timeout = time_point::max()) const noexcept {
         return _shared_future.get_future(timeout);
+    }
+
+    /// \brief Gets new future associated with this promise.
+    /// If the promise is not resolved before abort source is triggered the returned future will
+    /// resolve with \ref abort_requests_exception.
+    /// This instance doesn't have to be kept alive until the returned future resolves.
+    future_type get_shared_future(abort_source& as) const noexcept {
+        return _shared_future.get_future(as);
     }
 
     /// \brief Sets the shared_promise's value (as tuple; by copying), same as normal promise

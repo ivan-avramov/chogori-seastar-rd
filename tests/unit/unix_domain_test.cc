@@ -17,12 +17,16 @@
  */
 /*
  * Copyright (C) 2019 Red Hat, Inc.
- */ 
+ */
+
+#include <filesystem>
 
 #include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
+#include <seastar/net/socket_defs.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/thread.hh>
@@ -54,7 +58,7 @@ public:
 private:
     const string test_message{"are you still the same?"s};
     future<> init_server();
-    future<> client_round();
+    void client_round();
     const socket_address server_addr;
 
     const std::optional<string> client_path;
@@ -83,8 +87,8 @@ future<> ud_server_client::init_server() {
                         break;
                     }
                 }
-                (void)client_round().get0();
-            } 
+                client_round();
+            }
         });
 
         return do_until([this](){return rounds_left<=0;}, [&lstn,this]() {
@@ -125,23 +129,21 @@ future<> ud_server_client::init_server() {
 
 /// Send a message to the server, and expect (almost) the same string back.
 /// If 'client_path' is set, the client binds to the named path.
-future<> ud_server_client::client_round() {
-    auto cc = client_path ? 
-        engine().net().connect(server_addr, socket_address{unix_domain_addr{*client_path}}).get0() :
-        engine().net().connect(server_addr).get0();
+// Runs in a seastar::thread.
+void ud_server_client::client_round() {
+    auto cc = client_path ?
+        engine().net().connect(server_addr, socket_address{unix_domain_addr{*client_path}}).get() :
+        engine().net().connect(server_addr).get();
 
-    return do_with(cc.input(), cc.output(), [this](auto& inp, auto& out) {
+    auto inp = cc.input();
+    auto out = cc.output();
 
-        return out.write(test_message).then(
-            [&out](){ return out.flush(); }).then(
-            [&inp](){ return inp.read(); }).then(
-            [this,&inp](auto bb){
-                BOOST_REQUIRE_EQUAL(std::string_view(bb.begin(), bb.size()), "+"s+test_message);
-                return inp.close();
-            }).then([&out](){return out.close();}).then(
-            []{ return make_ready_future<>(); });
-    });
-
+    out.write(test_message).get();
+    out.flush().get();
+    auto bb = inp.read().get();
+    BOOST_REQUIRE_EQUAL(std::string_view(bb.begin(), bb.size()), "+"s+test_message);
+    inp.close().get();
+    out.close().get();
 }
 
 future<> ud_server_client::run() {
@@ -152,11 +154,16 @@ future<> ud_server_client::run() {
 
 }
 
+void rm(std::string_view what) {
+    auto res = system(fmt::format("rm -f {}", what).c_str());
+    BOOST_REQUIRE_EQUAL(res, 0);
+}
+
 //  testing the various address types, both on the server and on the
 //  client side
 
 SEASTAR_TEST_CASE(unixdomain_server) {
-    system("rm -f /tmp/ry");
+    rm("/tmp/ry");
     ud_server_client uds("/tmp/ry", std::nullopt, 3);
     return do_with(std::move(uds), [](auto& uds){
         return uds.run();
@@ -203,7 +210,7 @@ SEASTAR_TEST_CASE(unixdomain_text) {
 }
 
 SEASTAR_TEST_CASE(unixdomain_bind) {
-    system("rm -f 111 112");
+    rm("111 112");
     ud_server_client uds("111"s, "112"s, 1);
     return do_with(std::move(uds), [](auto& uds){
         return uds.run();
@@ -211,7 +218,7 @@ SEASTAR_TEST_CASE(unixdomain_bind) {
 }
 
 SEASTAR_TEST_CASE(unixdomain_short) {
-    system("rm -f 3");
+    rm("3");
     ud_server_client uds("3"s, std::nullopt, 10);
     return do_with(std::move(uds), [](auto& uds){
         return uds.run();
@@ -232,3 +239,57 @@ SEASTAR_TEST_CASE(unixdomain_abort) {
     });
 }
 
+// From man 7 unix:
+//  If a bind(2) call specifies addrlen as sizeof(sa_family_t), or
+//  the SO_PASSCRED socket option was specified for a socket that was
+//  not explicitly bound to an address, then the socket is autobound
+//  to an abstract address.
+static socket_address autobind() {
+    socket_address addr;
+    addr.addr_length = offsetof(sockaddr_un, sun_path);
+    addr.u.sa.sa_family = AF_UNIX;
+    return addr;
+}
+
+static string to_string(net::packet p) {
+    p.linearize();
+    const auto& f = p.frag(0);
+    return std::string(f.base, f.size);
+}
+
+SEASTAR_THREAD_TEST_CASE(unixdomain_datagram_autobind) {
+    auto chan1 = make_unbound_datagram_channel(AF_UNIX);
+    auto chan2 = make_bound_datagram_channel(autobind());
+
+    chan1.send(chan2.local_address(), "hello").get();
+    net::datagram dgram = chan2.receive().get();
+
+    string received = to_string(std::move(dgram.get_data()));
+    BOOST_REQUIRE_EQUAL(received, "hello");
+}
+
+SEASTAR_THREAD_TEST_CASE(unixdomain_datagram_named_bound) {
+    // Create a temporary directory for the socket file using mkdtemp.
+    char tmpdir[] = "/tmp/seastar-test-XXXXXX";
+    char* tmpdir_ptr = mkdtemp(tmpdir);
+    if (tmpdir_ptr == nullptr) {
+        throw std::runtime_error("mkdtemp failed");
+    }
+
+    // Create a socket file in the temporary directory.
+    std::string socket_path = format("{}/socket", tmpdir_ptr);
+    auto named_receiver = make_bound_datagram_channel(socket_address{unix_domain_addr{socket_path}});
+    // Verify that a socket file was created.
+    BOOST_REQUIRE(std::filesystem::exists(socket_path));
+
+    // Send a message to the named socket using an unbound socket.
+    auto sender = make_unbound_datagram_channel(AF_UNIX);
+    sender.send(socket_address{unix_domain_addr{socket_path}}, "hihi").get();
+
+    net::udp_datagram dgram = named_receiver.receive().get();
+    string received = to_string(std::move(dgram.get_data()));
+    BOOST_REQUIRE_EQUAL(received, "hihi");
+
+    // Try to be nice and remove the temporary directory.
+    std::filesystem::remove_all(tmpdir_ptr);
+}

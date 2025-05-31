@@ -21,13 +21,12 @@
 
 #pragma once
 
-#include <boost/intrusive/list.hpp>
-#include <boost/intrusive/slist.hpp>
-#include <boost/container/small_vector.hpp>
 #include <seastar/core/internal/io_intent.hh>
 #include <seastar/core/io_priority_class.hh>
-
-namespace bi = boost::intrusive;
+#include <seastar/util/modules.hh>
+#ifndef SEASTAR_MODULE
+#include <boost/container/small_vector.hpp>
+#endif
 
 namespace seastar {
 
@@ -41,14 +40,15 @@ namespace seastar {
 ///
 /// If no intent is provided, then the request is processed till its
 /// completion be it success or error
+SEASTAR_MODULE_EXPORT
 class io_intent {
     struct intents_for_queue {
-        dev_t dev;
-        io_priority_class_id qid;
+        unsigned qid;
+        io_priority_class_id cid;
         internal::cancellable_queue cq;
 
-        intents_for_queue(dev_t dev_, io_priority_class_id qid_) noexcept
-            : dev(dev_), qid(qid_), cq() {}
+        intents_for_queue(unsigned qid_, io_priority_class_id cid_) noexcept
+            : qid(qid_), cid(cid_), cq() {}
 
         intents_for_queue(intents_for_queue&&) noexcept = default;
         intents_for_queue& operator=(intents_for_queue&&) noexcept = default;
@@ -58,8 +58,7 @@ class io_intent {
         internal::intent_reference::container_type list;
 
         references(references&& o) noexcept : list(std::move(o.list)) {}
-
-        references() noexcept {}
+        references() noexcept : list() {}
         ~references() { clear(); }
 
         void clear() {
@@ -82,9 +81,7 @@ public:
     io_intent(const io_intent&) = delete;
     io_intent& operator=(const io_intent&) = delete;
     io_intent& operator=(io_intent&&) = delete;
-    io_intent(io_intent&& o) noexcept : 
-        _intents(std::move(o._intents)),
-        _refs(std::move(o._refs)) {
+    io_intent(io_intent&& o) noexcept : _intents(std::move(o._intents)), _refs(std::move(o._refs)) {
         for (auto&& r : _refs.list) {
             r._intent = this;
         }
@@ -99,14 +96,14 @@ public:
     }
 
     /// @private
-    internal::cancellable_queue& find_or_create_cancellable_queue(dev_t dev, io_priority_class_id qid) {
+    internal::cancellable_queue& find_or_create_cancellable_queue(unsigned qid, io_priority_class_id cid) {
         for (auto&& i : _intents) {
-            if (i.dev == dev && i.qid == qid) {
+            if (i.qid == qid && i.cid == cid) {
                 return i.cq;
             }
         }
 
-        _intents.emplace_back(dev, qid);
+        _intents.emplace_back(qid, cid);
         return _intents.back().cq;
     }
 };

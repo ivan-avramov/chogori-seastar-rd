@@ -25,12 +25,12 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/net/packet.hh>
 #include <seastar/core/sstring.hh>
-#include <memory>
-#include <vector>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/modules.hh>
 
 namespace seastar {
 
+SEASTAR_MODULE_EXPORT
 template <typename CharType>
 class scattered_message {
 private:
@@ -70,6 +70,12 @@ public:
     void append(std::string_view v) {
         if (v.size()) {
             _p = packet(std::move(_p), temporary_buffer<char>::copy_of(v));
+        }
+    }
+
+    void append(temporary_buffer<CharType> buff) {
+        if (buff.size()) {
+            _p = packet(std::move(_p), std::move(buff));
         }
     }
 

@@ -24,7 +24,9 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/posix.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_runner.hh>
+#include <seastar/util/assert.hh>
 
 namespace seastar {
 
@@ -47,7 +49,7 @@ test_runner::start(int ac, char** av) {
 
     // Don't interfere with seastar signal handling
     sigset_t mask;
-    sigfillset(&mask);            
+    sigfillset(&mask);
     for (auto sig : { SIGSEGV }) {
         sigdelset(&mask, sig);
     }
@@ -57,6 +59,11 @@ test_runner::start(int ac, char** av) {
         abort();
     }
 
+    _st_args = std::make_unique<start_thread_args>(ac, av);
+    return true;
+}
+
+bool test_runner::start_thread(int ac, char** av) {
     auto init_outcome = std::make_shared<exchanger<bool>>();
 
     namespace bpo = boost::program_options;
@@ -72,7 +79,7 @@ test_runner::start(int ac, char** av) {
             auto init = [&app] {
                 auto conf_seed = app.configuration()["random-seed"];
                 auto seed = conf_seed.empty() ? std::random_device()():  conf_seed.as<unsigned>();
-                std::cout << "random-seed=" << seed << '\n';
+                std::cout << "random-seed=" << seed << std::endl;
                 return smp::invoke_on_all([seed] {
                     auto local_seed = seed + this_shard_id();
                     local_random_engine.seed(local_seed);
@@ -92,16 +99,16 @@ test_runner::start(int ac, char** av) {
               }).or_terminate();
             }).then([&app] {
                 if (engine().abandoned_failed_futures()) {
-                    std::cerr << "*** " << engine().abandoned_failed_futures() << " abandoned failed future(s) detected\n";
+                    std::cerr << "*** " << engine().abandoned_failed_futures() << " abandoned failed future(s) detected" << std::endl;
                     if (app.configuration()["fail-on-abandoned-failed-futures"].as<bool>()) {
-                        std::cerr << "Failing the test because fail was requested by --fail-on-abandoned-failed-futures\n";
+                        std::cerr << "Failing the test because fail was requested by --fail-on-abandoned-failed-futures" << std::endl;
                         return 3;
                     }
                 }
                 return 0;
             });
         });
-        init_outcome->give(!_exit_code);
+        init_outcome->give(false);
     });
 
     return init_outcome->take();
@@ -109,8 +116,25 @@ test_runner::start(int ac, char** av) {
 
 void
 test_runner::run_sync(std::function<future<>()> task) {
+    if (_st_args) {
+        start_thread_args sa = *_st_args;
+        _st_args.reset();
+        if (!start_thread(sa.ac, sa.av)) {
+            // something bad happened when starting the reactor or app, and
+            // the _thread has exited before taking any task. but we need to
+            // move on. let's report this bad news with exit code
+            _done = true;
+        }
+    }
+    if (_done) {
+        // we failed to start the worker reactor, so we cannot send the task to
+        // it.
+        return;
+    }
+
     exchanger<std::exception_ptr> e;
     _task.give([task = std::move(task), &e] {
+        SEASTAR_ASSERT(engine_is_ready());
         try {
             return task().then_wrapped([&e](auto&& f) {
                 try {

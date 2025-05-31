@@ -20,13 +20,26 @@
  * Copyright 2020 ScyllaDB
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <cstdint>
+#include <deque>
+#include <optional>
+#include <filesystem>
 #include <iostream>
 #include <list>
-#include <deque>
+#include <vector>
+#include <sys/statvfs.h>
 
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/util/file.hh>
+#endif
 
 namespace seastar {
 
@@ -116,8 +129,20 @@ future<uint64_t> fs_free(std::string_view name) noexcept {
     });
 }
 
+future<std::filesystem::space_info> file_system_space(std::string_view name) noexcept {
+    return engine().file_system_space(name);
+}
+
 future<stat_data> file_stat(std::string_view name, follow_symlink follow) noexcept {
     return engine().file_stat(name, follow);
+}
+
+future<std::optional<struct group_details>> getgrnam(std::string_view name) {
+    return engine().getgrnam(name);
+}
+
+future<> chown(std::string_view filepath, uid_t owner, gid_t group) {
+    return engine().chown(filepath, owner, group);
 }
 
 future<uint64_t> file_size(std::string_view name) noexcept {
@@ -200,5 +225,21 @@ future<> recursive_remove_directory(fs::path path) noexcept {
         });
     });
 }
+
+namespace util {
+
+future<std::vector<temporary_buffer<char>>> read_entire_file(std::filesystem::path path) {
+    return with_file_input_stream(path, [] (input_stream<char>& in) {
+        return read_entire_stream(in);
+    });
+}
+
+future<sstring> read_entire_file_contiguous(std::filesystem::path path) {
+    return with_file_input_stream(path, [] (input_stream<char>& in) {
+        return read_entire_stream_contiguous(in);
+    });
+}
+
+} // namespace util
 
 } //namespace seastar

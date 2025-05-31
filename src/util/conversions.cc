@@ -19,28 +19,47 @@
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
 
-#ifndef CONVERSIONS_CC_
-#define CONVERSIONS_CC_
+#ifdef SEASTAR_MODULE
+module;
+#endif
 
-#include <seastar/util/conversions.hh>
-#include <seastar/core/print.hh>
+#include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
 #include <cctype>
 
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
+#include <seastar/util/conversions.hh>
+#include <seastar/core/print.hh>
+#endif
+
 namespace seastar {
 
-size_t parse_memory_size(std::string s) {
+static constexpr struct {
+    std::string_view suffix;
+    unsigned power;
+} suffixes[] = {
+    {"k", 10},
+    {"K", 10},
+    {"M", 20},
+    {"G", 30},
+    {"T", 40},
+};
+
+size_t parse_memory_size(std::string_view s) {
+    for (std::string_view unit : {"i", "iB", "B"}) {
+        if (boost::algorithm::ends_with(s, unit)) {
+            s.remove_suffix(unit.size());
+            break;
+        }
+    }
     size_t factor = 1;
-    if (s.size()) {
-        auto c = s[s.size() - 1];
-        if (!isdigit(c)) {
-            static std::string suffixes = "kMGT";
-            auto pos = suffixes.find(c);
-            if (pos == suffixes.npos) {
-                throw std::runtime_error(format("Cannot parse memory size '{}'", s));
-            }
-            factor <<= (pos + 1) * 10;
-            s = s.substr(0, s.size() - 1);
+    for (auto [suffix, power] : suffixes) {
+        if (boost::algorithm::ends_with(s, suffix)) {
+            factor <<= power;
+            s.remove_suffix(suffix.size());
+            break;
         }
     }
     return boost::lexical_cast<size_t>(s) * factor;
@@ -48,4 +67,3 @@ size_t parse_memory_size(std::string s) {
 
 }
 
-#endif /* CONVERSIONS_CC_ */

@@ -27,26 +27,35 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/when_all.hh>
-#include <boost/range/irange.hpp>
+#include <ranges>
+
+static constexpr fair_queue::class_id cid = 0;
 
 struct local_fq_and_class {
     seastar::fair_group fg;
     seastar::fair_queue fq;
     seastar::fair_queue sfq;
-    seastar::priority_class_ptr pclass;
     unsigned executed = 0;
+
+    static fair_group::config fg_config() {
+        fair_group::config cfg;
+        return cfg;
+    }
 
     seastar::fair_queue& queue(bool local) noexcept { return local ? fq : sfq; }
 
     local_fq_and_class(seastar::fair_group& sfg)
-        : fg(seastar::fair_group::config(1, 1))
+        : fg(fg_config(), 1)
         , fq(fg, seastar::fair_queue::config())
         , sfq(sfg, seastar::fair_queue::config())
-        , pclass(fq.register_priority_class(1))
-    {}
+    {
+        fq.register_priority_class(cid, 1);
+        sfq.register_priority_class(cid, 1);
+    }
 
     ~local_fq_and_class() {
-        fq.unregister_priority_class(pclass);
+        fq.unregister_priority_class(cid);
+        sfq.unregister_priority_class(cid);
     }
 };
 
@@ -55,8 +64,8 @@ struct local_fq_entry {
     std::function<void()> submit;
 
     template <typename Func>
-    local_fq_entry(unsigned weight, unsigned index, Func&& f)
-        : ent(seastar::fair_queue_ticket(weight, index))
+    local_fq_entry(fair_queue_entry::capacity_t cap, Func&& f)
+        : ent(cap)
         , submit(std::move(f)) {}
 };
 
@@ -68,8 +77,13 @@ struct perf_fair_queue {
 
     seastar::fair_group shared_fg;
 
+    static fair_group::config fg_config() {
+        fair_group::config cfg;
+        return cfg;
+    }
+
     perf_fair_queue()
-        : shared_fg(seastar::fair_group::config(smp::count, smp::count))
+        : shared_fg(fg_config(), smp::count)
     {
         local_fq.start(std::ref(shared_fg)).get();
     }
@@ -84,12 +98,13 @@ struct perf_fair_queue {
 future<> perf_fair_queue::test(bool loc) {
 
     auto invokers = local_fq.invoke_on_all([loc] (local_fq_and_class& local) {
-        return parallel_for_each(boost::irange(0u, requests_to_dispatch), [&local, loc] (unsigned dummy) {
-            auto req = std::make_unique<local_fq_entry>(1, 1, [&local, loc] {
+        return parallel_for_each(std::views::iota(0u, requests_to_dispatch), [&local, loc] (unsigned dummy) {
+            auto cap = local.queue(loc).tokens_capacity(double(1) / std::numeric_limits<int>::max() + double(1) / std::numeric_limits<int>::max());
+            auto req = std::make_unique<local_fq_entry>(cap, [&local, loc, cap] {
                 local.executed++;
-                local.queue(loc).notify_requests_finished(seastar::fair_queue_ticket{1, 1});
+                local.queue(loc).notify_request_finished(cap);
             });
-            local.queue(loc).queue(local.pclass, req->ent);
+            local.queue(loc).queue(cid, req->ent);
             req.release();
             return make_ready_future<>();
         });

@@ -20,21 +20,23 @@
  * Copyright (C) 2020 ScyllaDB Ltd.
  */
 
+#pragma once
+
 #include <seastar/util/tmp_file.hh>
 
 namespace seastar {
 
-/** 
+/**
  * Temp dir helper for RAII usage when doing tests
- * in seastar threads. Will not work in "normal" mode. 
- * Just use tmp_dir::do_with for that. 
+ * in seastar threads. Will not work in "normal" mode.
+ * Just use tmp_dir::do_with for that.
  */
 class tmpdir {
     seastar::tmp_dir _tmp;
 public:
     tmpdir(tmpdir&&) = default;
     tmpdir(const tmpdir&) = delete;
-    
+
     tmpdir(const sstring& name = sstring(seastar::default_tmpdir()) + "/testXXXX") {
         _tmp.create(std::filesystem::path(name)).get();
     }

@@ -27,6 +27,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/do_with.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
 
@@ -35,8 +36,6 @@ using namespace seastar::net;
 
 static const sstring seastar_name = "seastar.io";
 
-// not working
-#if 0
 static future<> test_resolve(dns_resolver::options opts) {
     auto d = ::make_lw_shared<dns_resolver>(std::move(opts));
     return d->get_host_by_name(seastar_name, inet_address::family::INET).then([d](hostent e) {
@@ -49,11 +48,6 @@ static future<> test_resolve(dns_resolver::options opts) {
         return d->close();
     });
 }
-
-SEASTAR_TEST_CASE(test_resolve_udp) {
-    return test_resolve(dns_resolver::options());
-}
-#endif
 
 static future<> test_bad_name(dns_resolver::options opts) {
     auto d = ::make_lw_shared<dns_resolver>(std::move(opts));
@@ -69,12 +63,20 @@ static future<> test_bad_name(dns_resolver::options opts) {
     });
 }
 
+using enable_if_with_networking = boost::unit_test::enable_if<SEASTAR_TESTING_WITH_NETWORKING>;
 
-SEASTAR_TEST_CASE(test_bad_name_udp) {
+SEASTAR_TEST_CASE(test_resolve_udp,
+                  *enable_if_with_networking()) {
+    return test_resolve(dns_resolver::options());
+}
+
+SEASTAR_TEST_CASE(test_bad_name_udp,
+                  *enable_if_with_networking()) {
     return test_bad_name(dns_resolver::options());
 }
 
-SEASTAR_TEST_CASE(test_timeout_udp) {
+SEASTAR_TEST_CASE(test_timeout_udp,
+                  *enable_if_with_networking()) {
     dns_resolver::options opts;
     opts.servers = std::vector<inet_address>({ inet_address("1.2.3.4") }); // not a server
     opts.udp_port = 29953; // not a dns port
@@ -93,16 +95,39 @@ SEASTAR_TEST_CASE(test_timeout_udp) {
     });
 }
 
-// Currently failing, disable until fixed (#521)
-#if 0
-SEASTAR_TEST_CASE(test_resolve_tcp) {
+// NOTE: cannot really test timeout in TCP mode, because seastar sockets do not support
+// connect with timeout -> cannot complete connect future in dns::do_connect in reasonable
+// time.
+
+// But we can test for connection refused working as expected.
+SEASTAR_TEST_CASE(test_connection_refused_tcp) {
+    dns_resolver::options opts;
+    opts.servers = std::vector<inet_address>({ inet_address("127.0.0.1") });
+    opts.use_tcp_query = true;
+    opts.tcp_port = 29953; // not a dns port
+
+    auto d = ::make_lw_shared<dns_resolver>(engine().net(), opts);
+    return d->get_host_by_name(seastar_name, inet_address::family::INET).then_wrapped([d](future<hostent> f) {
+        try {
+            f.get();
+            BOOST_FAIL("should not succeed");
+        } catch (...) {
+            // ok.
+        }
+    }).finally([d]{
+        return d->close();
+    });
+}
+
+SEASTAR_TEST_CASE(test_resolve_tcp,
+                  *enable_if_with_networking()) {
     dns_resolver::options opts;
     opts.use_tcp_query = true;
     return test_resolve(opts);
 }
-#endif
 
-SEASTAR_TEST_CASE(test_bad_name_tcp) {
+SEASTAR_TEST_CASE(test_bad_name_tcp,
+                  *enable_if_with_networking()) {
     dns_resolver::options opts;
     opts.use_tcp_query = true;
     return test_bad_name(opts);
@@ -130,6 +155,39 @@ static future<> test_srv() {
     });
 }
 
-SEASTAR_TEST_CASE(test_srv_tcp) {
+SEASTAR_TEST_CASE(test_srv_tcp,
+                  *enable_if_with_networking()) {
     return test_srv();
+}
+
+
+SEASTAR_TEST_CASE(test_parallel_resolve_name,
+                  *enable_if_with_networking()) {
+    dns_resolver::options opts;
+    opts.use_tcp_query = true;
+
+    auto d = ::make_lw_shared<dns_resolver>(std::move(opts));
+    return when_all(
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com")
+    ).finally([d](auto&&...) {}).discard_result();
+}
+
+SEASTAR_TEST_CASE(test_parallel_resolve_name_udp,
+                  *enable_if_with_networking()) {
+    dns_resolver::options opts;
+
+    auto d = ::make_lw_shared<dns_resolver>(std::move(opts));
+    return when_all(
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com"),
+        d->resolve_name("www.google.com")
+    ).finally([d](auto&...) {}).discard_result();
 }

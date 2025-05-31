@@ -9,10 +9,10 @@ Version: @PROJECT_VERSION@
 
 # Dependencies.
 boost_cflags=-I$<JOIN:@Boost_INCLUDE_DIRS@, -I>
-boost_unit_test_libs=@Boost_UNIT_TEST_FRAMEWORK_LIBRARY@
+boost_unit_test_libs=$<TARGET_PROPERTY:Boost::unit_test_framework,LOCATION>
 
 # Us.
-seastar_testing_cflags=-DBoost_TEST_DYN_LINK
+seastar_testing_cflags=
 seastar_testing_libs=${libdir}/$<TARGET_FILE_NAME:seastar_testing>
 
 Requires: seastar >= 1.0

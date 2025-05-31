@@ -21,87 +21,76 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
+#include <boost/container/static_vector.hpp>
+#include <chrono>
+#include <memory>
+#include <vector>
+#include <sys/uio.h>
+#endif
 #include <seastar/core/sstring.hh>
 #include <seastar/core/fair_queue.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/internal/io_request.hh>
-#include <mutex>
-#include <array>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/util/spinlock.hh>
+#include <seastar/util/modules.hh>
+
+struct io_queue_for_tests;
 
 namespace seastar {
 
-class io_priority_class;
+class io_queue;
+namespace internal {
+const fair_group& get_fair_group(const io_queue& ioq, unsigned stream);
+}
 
-/// Renames an io priority class
-///
-/// Renames an `io_priority_class` previously created with register_one_priority_class().
-///
-/// The operation is global and affects all shards.
-/// The operation affects the exported statistics labels.
-///
-/// \param pc The io priority class to be renamed
-/// \param new_name The new name for the io priority class
-/// \return a future that is ready when the io priority class have been renamed
-future<>
-rename_priority_class(io_priority_class pc, sstring new_name);
-
+SEASTAR_MODULE_EXPORT
 class io_intent;
 
 namespace internal {
 class io_sink;
-namespace linux_abi {
-
-struct io_event;
-struct iocb;
-
-}
 }
 
 using shard_id = unsigned;
+using stream_id = unsigned;
 
-class io_priority_class;
-class io_queue;
 class io_desc_read_write;
 class queued_io_request;
-
-class io_group {
-public:
-    struct config {
-        unsigned max_req_count = std::numeric_limits<int>::max();
-        unsigned max_bytes_count = std::numeric_limits<int>::max();
-    };
-    explicit io_group(config cfg) noexcept;
-
-private:
-    friend class io_queue;
-    fair_group _fg;
-    const unsigned _maximum_request_size;
-
-    static fair_group::config make_fair_group_config(config cfg) noexcept;
-};
+class io_group;
 
 using io_group_ptr = std::shared_ptr<io_group>;
-struct priority_class_data;
+using iovec_keeper = std::vector<::iovec>;
+
+namespace internal {
+struct maybe_priority_class_ref;
+class priority_class {
+    unsigned _id;
+public:
+    explicit priority_class(const scheduling_group& sg) noexcept;
+    explicit priority_class(internal::maybe_priority_class_ref pc) noexcept;
+    unsigned id() const noexcept { return _id; }
+};
+}
 
 class io_queue {
+public:
+    class priority_class_data;
+
 private:
-    std::vector<std::vector<std::unique_ptr<priority_class_data>>> _priority_classes;
+    std::vector<std::unique_ptr<priority_class_data>> _priority_classes;
     io_group_ptr _group;
-    fair_queue _fq;
+    const unsigned _id;
+    boost::container::static_vector<fair_queue, 2> _streams;
     internal::io_sink& _sink;
 
-    static constexpr unsigned _max_classes = 2048;
-    static std::mutex _register_lock;
-    static std::array<uint32_t, _max_classes> _registered_shares;
-    static std::array<sstring, _max_classes> _registered_names;
+    friend struct ::io_queue_for_tests;
+    friend const fair_group& internal::get_fair_group(const io_queue& ioq, unsigned stream);
 
-public:
-    static io_priority_class register_one_priority_class(sstring name, uint32_t shares);
-    static bool rename_one_priority_class(io_priority_class pc, sstring name);
-
-private:
-    priority_class_data& find_or_create_class(const io_priority_class& pc, shard_id owner);
+    priority_class_data& find_or_create_class(internal::priority_class pc);
+    future<size_t> queue_request(internal::priority_class pc, internal::io_direction_and_length dnl, internal::io_request req, io_intent* intent, iovec_keeper iovs) noexcept;
+    future<size_t> queue_one_request(internal::priority_class pc, internal::io_direction_and_length dnl, internal::io_request req, io_intent* intent, iovec_keeper iovs) noexcept;
 
     // The fields below are going away, they are just here so we can implement deprecated
     // functions that used to be provided by the fair_queue and are going away (from both
@@ -109,7 +98,27 @@ private:
     // decoupling and is temporary
     size_t _queued_requests = 0;
     size_t _requests_executing = 0;
+    uint64_t _requests_dispatched = 0;
+    uint64_t _requests_completed = 0;
+
+    // Flow monitor
+    uint64_t _prev_dispatched = 0;
+    uint64_t _prev_completed = 0;
+    double _flow_ratio = 1.0;
+
+    timer<lowres_clock> _averaging_decay_timer;
+
+    const std::chrono::milliseconds _stall_threshold_min;
+    std::chrono::milliseconds _stall_threshold;
+
+    void update_flow_ratio() noexcept;
+    void lower_stall_threshold() noexcept;
+
+    metrics::metric_groups _metric_groups;
 public:
+
+    using clock_type = std::chrono::steady_clock;
+
     // We want to represent the fact that write requests are (maybe) more expensive
     // than read requests. To avoid dealing with floating point math we will scale one
     // read request to be counted by this amount.
@@ -119,33 +128,40 @@ public:
     // It is also technically possible for reads to be the expensive ones, in which case
     // writes will have an integer value lower than read_request_base_count.
     static constexpr unsigned read_request_base_count = 128;
-    static constexpr unsigned request_ticket_size_shift = 9;
-    static constexpr unsigned minimal_request_size = 512;
+    static constexpr unsigned block_size_shift = 9;
 
     struct config {
-        dev_t devid;
-        unsigned capacity = std::numeric_limits<unsigned>::max();
+        unsigned id;
+        unsigned long req_count_rate = std::numeric_limits<int>::max();
+        unsigned long blocks_count_rate = std::numeric_limits<int>::max();
         unsigned disk_req_write_to_read_multiplier = read_request_base_count;
-        unsigned disk_bytes_write_to_read_multiplier = read_request_base_count;
-        float disk_us_per_request = 0;
-        float disk_us_per_byte = 0;
+        unsigned disk_blocks_write_to_read_multiplier = read_request_base_count;
+        size_t disk_read_saturation_length = std::numeric_limits<size_t>::max();
+        size_t disk_write_saturation_length = std::numeric_limits<size_t>::max();
         sstring mountpoint = "undefined";
+        bool duplex = false;
+        std::chrono::duration<double> rate_limit_duration = std::chrono::milliseconds(1);
+        size_t block_count_limit_min = 1;
+        unsigned averaging_decay_ticks = 100;
+        double flow_ratio_ema_factor = 0.95;
+        double flow_ratio_backpressure_threshold = 1.1;
+        std::chrono::milliseconds stall_threshold = std::chrono::milliseconds(100);
     };
 
-    io_queue(io_group_ptr group, internal::io_sink& sink, config cfg);
+    io_queue(io_group_ptr group, internal::io_sink& sink);
     ~io_queue();
 
-    fair_queue_ticket request_fq_ticket(const internal::io_request& req, size_t len) const;
+    stream_id request_stream(internal::io_direction_and_length dnl) const noexcept;
 
-    future<size_t>
-    queue_request(const io_priority_class& pc, size_t len, internal::io_request req, io_intent* intent) noexcept;
-    void submit_request(io_desc_read_write* desc, internal::io_request req, priority_class_data& pclass) noexcept;
-    void cancel_request(queued_io_request& req, priority_class_data& pclass) noexcept;
+    future<size_t> submit_io_read(internal::priority_class priority_class,
+            size_t len, internal::io_request req, io_intent* intent, iovec_keeper iovs = {}) noexcept;
+    future<size_t> submit_io_write(internal::priority_class priority_class,
+            size_t len, internal::io_request req, io_intent* intent, iovec_keeper iovs = {}) noexcept;
+
+    void submit_request(io_desc_read_write* desc, internal::io_request req) noexcept;
+    void cancel_request(queued_io_request& req) noexcept;
     void complete_cancelled_request(queued_io_request& req) noexcept;
-
-    [[deprecated("modern I/O queues should use a property file")]] size_t capacity() const {
-        return _config.capacity;
-    }
+    void complete_request(io_desc_read_write& desc, std::chrono::duration<double> delay) noexcept;
 
     [[deprecated("I/O queue users should not track individual requests, but resources (weight, size) passing through the queue")]]
     size_t queued_requests() const {
@@ -158,29 +174,68 @@ public:
         return _requests_executing;
     }
 
-    void notify_requests_finished(fair_queue_ticket& desc) noexcept;
-
     // Dispatch requests that are pending in the I/O queue
     void poll_io_queue();
 
-    std::chrono::steady_clock::time_point next_pending_aio() const noexcept {
-        return _fq.next_pending_aio();
-    }
+    clock_type::time_point next_pending_aio() const noexcept;
+    fair_queue_entry::capacity_t request_capacity(internal::io_direction_and_length dnl) const noexcept;
 
-    sstring mountpoint() const {
-        return _config.mountpoint;
-    }
+    sstring mountpoint() const;
+    unsigned id() const noexcept { return _id; }
 
-    dev_t dev_id() const noexcept {
-        return _config.devid;
-    }
+    void update_shares_for_class(internal::priority_class pc, size_t new_shares);
+    future<> update_bandwidth_for_class(internal::priority_class pc, uint64_t new_bandwidth);
+    void rename_priority_class(internal::priority_class pc, sstring new_name);
+    void throttle_priority_class(const priority_class_data& pc) noexcept;
+    void unthrottle_priority_class(const priority_class_data& pc) noexcept;
 
-    future<> update_shares_for_class(io_priority_class pc, size_t new_shares);
-    void rename_priority_class(io_priority_class pc, sstring new_name);
+    struct request_limits {
+        size_t max_read;
+        size_t max_write;
+    };
+
+    request_limits get_request_limits() const noexcept;
+    const config& get_config() const noexcept;
 
 private:
-    config _config;
-    static fair_queue::config make_fair_queue_config(config cfg);
+    static fair_queue::config make_fair_queue_config(const config& cfg, sstring label);
+    void register_stats(sstring name, priority_class_data& pc);
 };
+
+class io_group {
+public:
+    explicit io_group(io_queue::config io_cfg, unsigned nr_queues);
+    ~io_group();
+    struct priority_class_data;
+
+    std::chrono::duration<double> io_latency_goal() const noexcept;
+
+private:
+    friend class io_queue;
+    friend struct ::io_queue_for_tests;
+    friend const fair_group& internal::get_fair_group(const io_queue& ioq, unsigned stream);
+
+    const io_queue::config _config;
+    size_t _max_request_length[2];
+    boost::container::static_vector<fair_group, 2> _fgs;
+    std::vector<std::unique_ptr<priority_class_data>> _priority_classes;
+    util::spinlock _lock;
+    const shard_id _allocated_on;
+
+    static fair_group::config make_fair_group_config(const io_queue::config& qcfg) noexcept;
+    priority_class_data& find_or_create_class(internal::priority_class pc);
+};
+
+inline const io_queue::config& io_queue::get_config() const noexcept {
+    return _group->_config;
+}
+
+inline sstring io_queue::mountpoint() const {
+    return get_config().mountpoint;
+}
+
+namespace internal {
+double request_tokens(io_direction_and_length dnl, const io_queue::config& cfg) noexcept;
+}
 
 }

@@ -22,19 +22,31 @@
 
 find_package (PkgConfig REQUIRED)
 
-pkg_check_modules (c-ares_PC libcares)
+pkg_check_modules (PC_c-ares QUIET libcares)
 
 find_library (c-ares_LIBRARY
   NAMES cares
   HINTS
-    ${c-ares_PC_LIBDIR}
-    ${c-ares_PC_LIBRARY_DIRS})
+    ${PC_c-ares_LIBDIR}
+    ${PC_c-ares_LIBRARY_DIRS})
 
 find_path (c-ares_INCLUDE_DIR
   NAMES ares_dns.h
   HINTS
-    ${c-ares_PC_INCLUDEDIR}
-    ${c-ares_PC_INCLUDE_DIRS})
+    ${PC_c-ares_INCLUDEDIR}
+    ${PC_c-ares_INCLUDE_DIRS})
+
+if (c-ares_INCLUDE_DIR)
+  foreach (v MAJOR MINOR PATCH)
+    file(STRINGS "${c-ares_INCLUDE_DIR}/ares_version.h" ares_VERSION_LINE
+      REGEX "^#define[ \t]+ARES_VERSION_${v}[ \t]+[0-9]+$")
+    if (ares_VERSION_LINE MATCHES "ARES_VERSION_${v} ([0-9]+)")
+      set (c-ares_VERSION_${v} "${CMAKE_MATCH_1}")
+    endif ()
+    unset (ares_VERSION_LINE)
+  endforeach ()
+  set (c-ares_VERSION ${c-ares_VERSION_MAJOR}.${c-ares_VERSION_MINOR}.${c-ares_VERSION_PATCH})
+endif ()
 
 mark_as_advanced (
   c-ares_LIBRARY
@@ -46,16 +58,17 @@ find_package_handle_standard_args (c-ares
   REQUIRED_VARS
     c-ares_LIBRARY
     c-ares_INCLUDE_DIR
-  VERSION_VAR c-ares_PC_VERSION)
+  VERSION_VAR c-ares_VERSION)
 
-set (c-ares_LIBRARIES ${c-ares_LIBRARY})
-set (c-ares_INCLUDE_DIRS ${c-ares_INCLUDE_DIR})
+if (c-ares_FOUND)
+  set (c-ares_LIBRARIES ${c-ares_LIBRARY})
+  set (c-ares_INCLUDE_DIRS ${c-ares_INCLUDE_DIR})
+  if (NOT (TARGET c-ares::cares))
+    add_library (c-ares::cares UNKNOWN IMPORTED)
 
-if (c-ares_FOUND AND NOT (TARGET c-ares::c-ares))
-  add_library (c-ares::c-ares UNKNOWN IMPORTED)
-
-  set_target_properties (c-ares::c-ares
-    PROPERTIES
-      IMPORTED_LOCATION ${c-ares_LIBRARY}
-      INTERFACE_INCLUDE_DIRECTORIES ${c-ares_INCLUDE_DIRS})
+    set_target_properties (c-ares::cares
+      PROPERTIES
+        IMPORTED_LOCATION ${c-ares_LIBRARY}
+        INTERFACE_INCLUDE_DIRECTORIES ${c-ares_INCLUDE_DIRS})
+  endif ()
 endif ()

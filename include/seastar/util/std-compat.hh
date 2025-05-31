@@ -21,11 +21,9 @@
 
 #pragma once
 
-#include <optional>
-#include <string_view>
-#include <variant>
+#include <seastar/util/modules.hh>
 
-#include <filesystem>
+#ifndef SEASTAR_MODULE
 
 #if __has_include(<memory_resource>)
 #include <memory_resource>
@@ -34,10 +32,6 @@
 namespace std::pmr {
     using namespace std::experimental::pmr;
 }
-#endif
-
-#if defined(__cpp_impl_coroutine) || defined(__cpp_coroutines)
-#define SEASTAR_COROUTINES_ENABLED
 #endif
 
 // Defining SEASTAR_ASAN_ENABLED in here is a bit of a hack, but
@@ -52,3 +46,31 @@ namespace std::pmr {
 #if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
 #define SEASTAR_ASAN_ENABLED
 #endif
+
+#if __has_include(<source_location>)
+#include <source_location>
+#endif
+
+#if defined(__cpp_lib_source_location) && !defined(SEASTAR_BROKEN_SOURCE_LOCATION)
+// good
+#elif __has_include(<experimental/source_location>) && !defined(SEASTAR_BROKEN_SOURCE_LOCATION)
+#include <experimental/source_location>
+#else
+#include <seastar/util/source_location-compat.hh>
+#endif
+
+#endif // !defined(SEASTAR_MODULE)
+
+namespace seastar::compat {
+SEASTAR_MODULE_EXPORT_BEGIN
+
+#if defined(__cpp_lib_source_location) && !defined(SEASTAR_BROKEN_SOURCE_LOCATION)
+using source_location = std::source_location;
+#elif __has_include(<experimental/source_location>) && !defined(SEASTAR_BROKEN_SOURCE_LOCATION)
+using source_location = std::experimental::source_location;
+#else
+using source_location = seastar::internal::source_location;
+#endif
+
+SEASTAR_MODULE_EXPORT_END
+}

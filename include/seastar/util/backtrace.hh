@@ -21,15 +21,24 @@
 
 #pragma once
 
-#include <execinfo.h>
-#include <iosfwd>
-#include <variant>
-#include <boost/container/static_vector.hpp>
-
+#include <seastar/core/format.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/print.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/assert.hh>
+#include <seastar/util/modules.hh>
+
+#ifndef SEASTAR_MODULE
+#if __has_include(<execinfo.h>)
+#include <execinfo.h>
+#define HAVE_EXECINFO
+#endif
+#include <iosfwd>
+#include <memory>
+#include <variant>
+#include <boost/container/static_vector.hpp>
+#include <fmt/ostream.h>
+#endif
 
 namespace seastar {
 
@@ -44,46 +53,78 @@ struct frame {
     uintptr_t addr;
 };
 
-bool operator==(const frame& a, const frame& b);
+bool operator==(const frame& a, const frame& b) noexcept;
 
 
 // If addr doesn't seem to belong to any of the provided shared objects, it
 // will be considered as part of the executable.
-frame decorate(uintptr_t addr);
+frame decorate(uintptr_t addr) noexcept;
 
 // Invokes func for each frame passing it as argument.
+// incremental=false is the default mode and simply calls ::backtrace once
+// and then calls func for each frame. If the ::backtrace call crashes,
+// func will not be called.
+// incremental=true will call ::backtrace in a loop, increasing the number of
+// frames to capture by one each time. This is useful for cases where
+// ::backtrace itself may crash, e.g., in a crash handler, in this case the
+// func will be called for each frame which didn't crash. See #2710. This
+// is much slower, however.
+SEASTAR_MODULE_EXPORT
 template<typename Func>
-void backtrace(Func&& func) noexcept(noexcept(func(frame()))) {
+void backtrace(Func&& func, bool incremental = false) noexcept(noexcept(func(frame()))) {
+#ifdef HAVE_EXECINFO
     constexpr size_t max_backtrace = 100;
     void* buffer[max_backtrace];
-    int n = ::backtrace(buffer, max_backtrace);
-    for (int i = 0; i < n; ++i) {
-        auto ip = reinterpret_cast<uintptr_t>(buffer[i]);
-        func(decorate(ip - 1));
+
+    if (incremental) {
+        for (size_t last_frame = 1; last_frame <= max_backtrace; ++last_frame) {
+            int n = ::backtrace(buffer, last_frame);
+            if (n < static_cast<int>(last_frame)) {
+                return;
+            }
+            auto ip = reinterpret_cast<uintptr_t>(buffer[last_frame-1]);
+            func(decorate(ip - 1));
+        }
+    } else {
+        int n = ::backtrace(buffer, max_backtrace);
+        for (int i = 0; i < n; ++i) {
+            auto ip = reinterpret_cast<uintptr_t>(buffer[i]);
+            func(decorate(ip - 1));
+        }
     }
+#else
+// Not implemented yet
+#define SEASTAR_BACKTRACE_UNIMPLEMENTED
+#endif
 }
 
 // Represents a call stack of a single thread.
+SEASTAR_MODULE_EXPORT
 class simple_backtrace {
 public:
     using vector_type = boost::container::static_vector<frame, 64>;
 private:
     vector_type _frames;
-    size_t _hash;
+    size_t _hash = 0;
+    char _delimeter = ' ';
 private:
-    size_t calculate_hash() const;
+    size_t calculate_hash() const noexcept;
 public:
-    simple_backtrace() = default;
-    simple_backtrace(vector_type f) : _frames(std::move(f)) {}
-    size_t hash() const { return _hash; }
+    simple_backtrace(vector_type f) noexcept : _frames(std::move(f)), _hash(calculate_hash()) {}
+    simple_backtrace() noexcept = default;
+    [[deprecated]] simple_backtrace(vector_type f, char delimeter) : _frames(std::move(f)), _hash(calculate_hash()), _delimeter(delimeter) {}
+    [[deprecated]] simple_backtrace(char delimeter) : _delimeter(delimeter) {}
 
-    friend std::ostream& operator<<(std::ostream& out, const simple_backtrace&);
+    size_t hash() const noexcept { return _hash; }
+    char delimeter() const noexcept { return _delimeter; }
 
-    bool operator==(const simple_backtrace& o) const {
+    friend fmt::formatter<simple_backtrace>;
+
+    bool operator==(const simple_backtrace& o) const noexcept {
         return _hash == o._hash && _frames == o._frames;
     }
 
-    bool operator!=(const simple_backtrace& o) const {
+    bool operator!=(const simple_backtrace& o) const noexcept {
         return !(*this == o);
     }
 };
@@ -94,25 +135,26 @@ using shared_backtrace = seastar::lw_shared_ptr<simple_backtrace>;
 class task_entry {
     const std::type_info* _task_type;
 public:
-    task_entry(const std::type_info& ti)
+    task_entry(const std::type_info& ti) noexcept
         : _task_type(&ti)
     { }
 
-    friend std::ostream& operator<<(std::ostream& out, const task_entry&);
+    friend fmt::formatter<task_entry>;
 
-    bool operator==(const task_entry& o) const {
+    bool operator==(const task_entry& o) const noexcept {
         return *_task_type == *o._task_type;
     }
 
-    bool operator!=(const task_entry& o) const {
+    bool operator!=(const task_entry& o) const noexcept {
         return !(*this == o);
     }
 
-    size_t hash() const { return _task_type->hash_code(); }
+    size_t hash() const noexcept { return _task_type->hash_code(); }
 };
 
 // Extended backtrace which consists of a backtrace of the currently running task
 // and information about the chain of tasks waiting for the current operation to complete.
+SEASTAR_MODULE_EXPORT
 class tasktrace {
 public:
     using entry = std::variant<shared_backtrace, task_entry>;
@@ -124,16 +166,19 @@ private:
     size_t _hash;
 public:
     tasktrace() = default;
-    tasktrace(simple_backtrace main, vector_type prev, size_t prev_hash, scheduling_group sg);
+    tasktrace(simple_backtrace main, vector_type prev, size_t prev_hash, scheduling_group sg) noexcept;
+    tasktrace(const tasktrace&) = default;
+    tasktrace& operator=(const tasktrace&) = default;
     ~tasktrace();
 
-    size_t hash() const { return _hash; }
+    size_t hash() const noexcept { return _hash; }
+    char delimeter() const noexcept { return _main.delimeter(); }
 
-    friend std::ostream& operator<<(std::ostream& out, const tasktrace&);
+    friend fmt::formatter<tasktrace>;
 
-    bool operator==(const tasktrace& o) const;
+    bool operator==(const tasktrace& o) const noexcept;
 
-    bool operator!=(const tasktrace& o) const {
+    bool operator!=(const tasktrace& o) const noexcept {
         return !(*this == o);
     }
 };
@@ -142,6 +187,7 @@ public:
 
 namespace std {
 
+SEASTAR_MODULE_EXPORT
 template<>
 struct hash<seastar::simple_backtrace> {
     size_t operator()(const seastar::simple_backtrace& b) const {
@@ -149,6 +195,7 @@ struct hash<seastar::simple_backtrace> {
     }
 };
 
+SEASTAR_MODULE_EXPORT
 template<>
 struct hash<seastar::tasktrace> {
     size_t operator()(const seastar::tasktrace& b) const {
@@ -157,6 +204,23 @@ struct hash<seastar::tasktrace> {
 };
 
 }
+
+template <> struct fmt::formatter<seastar::frame> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const seastar::frame&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <> struct fmt::formatter<seastar::simple_backtrace> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const seastar::simple_backtrace&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <> struct fmt::formatter<seastar::tasktrace> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const seastar::tasktrace&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <> struct fmt::formatter<seastar::task_entry> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const seastar::task_entry&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
 
 namespace seastar {
 
@@ -188,7 +252,7 @@ public:
      * @return original exception message followed by a backtrace
      */
     virtual const char* what() const noexcept override {
-        assert(_backtrace);
+        SEASTAR_ASSERT(_backtrace);
         return _backtrace->c_str();
     }
 };
@@ -203,10 +267,11 @@ public:
 /// \tparam Args types of arguments forwarded to the constructor of Exc
 /// \param args arguments forwarded to the constructor of Exc
 /// \return std::exception_ptr containing the exception with the backtrace.
+SEASTAR_MODULE_EXPORT
 template <class Exc, typename... Args>
 std::exception_ptr make_backtraced_exception_ptr(Args&&... args) {
     using exc_type = std::decay_t<Exc>;
-    static_assert(std::is_base_of<std::exception, exc_type>::value,
+    static_assert(std::is_base_of_v<std::exception, exc_type>,
             "throw_with_backtrace only works with exception types");
     return std::make_exception_ptr<internal::backtraced<exc_type>>(Exc(std::forward<Args>(args)...));
 }
@@ -220,6 +285,7 @@ std::exception_ptr make_backtraced_exception_ptr(Args&&... args) {
      * @param args arguments forwarded to the constructor of Exc
      * @return never returns (throws an exception)
      */
+SEASTAR_MODULE_EXPORT
 template <class Exc, typename... Args>
 [[noreturn]]
 void

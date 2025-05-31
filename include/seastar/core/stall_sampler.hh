@@ -25,7 +25,6 @@
 #include <seastar/core/future.hh>
 #include <seastar/util/noncopyable_function.hh>
 
-#include <chrono>
 #include <iosfwd>
 
 // Instrumentation to detect context switches during reactor execution
@@ -37,8 +36,8 @@ namespace internal {
 
 struct stall_report {
     uint64_t kernel_stalls;
-    std::chrono::steady_clock::duration run_wall_time;  // excludes sleeps
-    std::chrono::steady_clock::duration stall_time;
+    sched_clock::duration run_wall_time;  // excludes sleeps
+    sched_clock::duration stall_time;
 };
 
 /// Run the unit-under-test (uut) function until completion, and report on any

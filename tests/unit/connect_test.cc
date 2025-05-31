@@ -1,4 +1,5 @@
 #include <seastar/core/reactor.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/test_runner.hh>
 #include <seastar/net/ip.hh>
@@ -7,7 +8,7 @@ using namespace seastar;
 using namespace net;
 
 SEASTAR_TEST_CASE(test_connection_attempt_is_shutdown) {
-    ipv4_addr server_addr("172.16.0.1");
+    ipv4_addr server_addr("127.0.0.1");
     auto unconn = make_socket();
     auto f = unconn
         .connect(make_ipv4_address(server_addr))

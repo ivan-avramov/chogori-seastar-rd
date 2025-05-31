@@ -20,18 +20,23 @@
  */
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <functional>
 #include <unordered_set>
-
-#include <boost/any.hpp>
+#include <map>
+#include <any>
+#include <fmt/format.h>
+#endif
 
 #include <seastar/core/future.hh>
+#include <seastar/core/internal/api-level.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/net/socket_defs.hh>
+#include <seastar/net/inet_address.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/modules.hh>
 #include <seastar/net/api.hh>
-#include "../core/internal/api-level.hh"
 
 namespace seastar {
 
@@ -51,7 +56,9 @@ class socket_address;
  * with OpenSSL or similar.
  *
  */
+SEASTAR_MODULE_EXPORT
 namespace tls {
+
     enum class x509_crt_format {
         DER,
         PEM,
@@ -109,9 +116,13 @@ namespace tls {
     };
 
     class abstract_credentials {
-    public:
+    protected:
+        abstract_credentials() = default;
+        abstract_credentials(const abstract_credentials&) = default;
+        abstract_credentials& operator=(abstract_credentials&) = default;
+        abstract_credentials& operator=(abstract_credentials&&) = default;
         virtual ~abstract_credentials() {};
-
+    public:
         virtual void set_x509_trust(const blob&, x509_crt_format) = 0;
         virtual void set_x509_crl(const blob&, x509_crt_format) = 0;
         virtual void set_x509_key(const blob& cert, const blob& key, x509_crt_format) = 0;
@@ -210,6 +221,11 @@ namespace tls {
          */
         void set_dn_verification_callback(dn_callback);
 
+        /**
+         * Optional override to disable certificate verification
+         */
+        void set_enable_certificate_verification(bool enable);
+
     private:
         class impl;
         friend class session;
@@ -232,6 +248,14 @@ namespace tls {
     };
 
     /**
+     * Session resumption support.
+     * We only support TLS1.3 session tickets.
+    */
+    enum class session_resume_mode {
+        NONE, TLS13_SESSION_TICKET
+    };
+
+    /**
      * Extending certificates and keys for server usage.
      * More probably goes in here...
      */
@@ -248,11 +272,21 @@ namespace tls {
         server_credentials& operator=(const server_credentials&) = delete;
 
         void set_client_auth(client_auth);
+
+        /**
+         * Sets session resume mode.
+         * If session resumption is set to TLS13 session tickets,
+         * calling this also functions as key rotation, i.e. creates
+         * a new window of TLS session keys.
+        */
+        void set_session_resume_mode(session_resume_mode);
     };
 
     class reloadable_credentials_base;
+    class credentials_builder;
 
     using reload_callback = std::function<void(const std::unordered_set<sstring>&, std::exception_ptr)>;
+    using reload_callback_ex = std::function<future<>(const credentials_builder&, const std::unordered_set<sstring>&, std::exception_ptr)>;
 
     /**
      * Intentionally "primitive", and more importantly, copyable
@@ -281,22 +315,56 @@ namespace tls {
         future<> set_system_trust();
         void set_client_auth(client_auth);
         void set_priority_string(const sstring&);
+        /**
+         * Sets session resume mode to be applied to all created server credential sets
+         * Note: setting this will generate a session key that will be reused across all
+         * built server credentials, i.e. they will share resume key.
+         * If you wish to reuse a builder to create disparate server crendentials,
+         * simply call this method again to regenerate the key.
+         */
+        void set_session_resume_mode(session_resume_mode);
 
         void apply_to(certificate_credentials&) const;
 
         shared_ptr<certificate_credentials> build_certificate_credentials() const;
         shared_ptr<server_credentials> build_server_credentials() const;
 
+        void rebuild(certificate_credentials&) const;
+        void rebuild(server_credentials&) const;
+
         // same as above, but any files used for certs/keys etc will be watched
         // for modification and reloaded if changed
-        future<shared_ptr<certificate_credentials>> build_reloadable_certificate_credentials(reload_callback = {}, std::optional<std::chrono::milliseconds> tolerance = {}) const;
-        future<shared_ptr<server_credentials>> build_reloadable_server_credentials(reload_callback = {}, std::optional<std::chrono::milliseconds> tolerance = {}) const;
+        future<shared_ptr<certificate_credentials>> build_reloadable_certificate_credentials(reload_callback_ex = {}, std::optional<std::chrono::milliseconds> tolerance = {}) const;
+        future<shared_ptr<server_credentials>> build_reloadable_server_credentials(reload_callback_ex = {}, std::optional<std::chrono::milliseconds> tolerance = {}) const;
+
+        future<shared_ptr<certificate_credentials>> build_reloadable_certificate_credentials(reload_callback, std::optional<std::chrono::milliseconds> tolerance = {}) const;
+        future<shared_ptr<server_credentials>> build_reloadable_server_credentials(reload_callback, std::optional<std::chrono::milliseconds> tolerance = {}) const;
     private:
         friend class reloadable_credentials_base;
 
-        std::multimap<sstring, boost::any> _blobs;
+        std::multimap<sstring, std::any> _blobs;
         client_auth _client_auth = client_auth::NONE;
+        session_resume_mode _session_resume_mode = session_resume_mode::NONE;
         sstring _priority;
+        std::vector<uint8_t> _session_resume_key;
+    };
+
+    using session_data = std::vector<uint8_t>;
+
+    /// TLS configuration options
+    struct tls_options {
+        /// \brief whether to wait for EOF from server on session termination
+        bool wait_for_eof_on_shutdown = true;
+        /// \brief server name to be used for the SNI TLS extension
+        sstring server_name = {};
+
+        /// \brief whether server certificate should be verified. May be set to false
+        /// in test environments.
+        bool verify_certificate = true;
+
+        /// \brief Optional session resume data. Must be retrieved via
+        /// get_session_resume_data below.
+        session_data session_resume_data;
     };
 
     /**
@@ -305,11 +373,28 @@ namespace tls {
      * Typically these should contain enough information
      * to validate the remote certificate (i.e. trust info).
      *
-     * \param name An optional expected server name for the remote end point
+     * ATTN: The method is going to be deprecated
+     *
+     * \param name The expected server name for the remote end point
      */
     /// @{
-    future<connected_socket> connect(shared_ptr<certificate_credentials>, socket_address, sstring name = {});
-    future<connected_socket> connect(shared_ptr<certificate_credentials>, socket_address, socket_address local, sstring name = {});
+    [[deprecated("Use overload with tls_options parameter")]]
+    future<connected_socket> connect(shared_ptr<certificate_credentials>, socket_address, sstring name);
+    [[deprecated("Use overload with tls_options parameter")]]
+    future<connected_socket> connect(shared_ptr<certificate_credentials>, socket_address, socket_address local, sstring name);
+    /// @}
+
+    /**
+     * Creates a TLS client connection using the default network stack and the
+     * supplied credentials.
+     * Typically these should contain enough information
+     * to validate the remote certificate (i.e. trust info).
+     *
+     * \param options Optional additional session configuration
+     */
+    /// @{
+    future<connected_socket> connect(shared_ptr<certificate_credentials>, socket_address, tls_options option = {});
+    future<connected_socket> connect(shared_ptr<certificate_credentials>, socket_address, socket_address local, tls_options options = {});
     /// @}
 
     /**
@@ -318,16 +403,47 @@ namespace tls {
      * Typically these should contain enough information
      * to validate the remote certificate (i.e. trust info).
      *
-     * \param name An optional expected server name for the remote end point
+     * ATTN: The method is going to be deprecated
+     *
+     * \param name The expected server name for the remote end point
      */
     /// @{
-    ::seastar::socket socket(shared_ptr<certificate_credentials>, sstring name = {});
+    [[deprecated("Use overload with tls_options parameter")]]
+    ::seastar::socket socket(shared_ptr<certificate_credentials>, sstring name);
     /// @}
 
-    /** Wraps an existing connection in SSL/TLS. */
+    /**
+     * Creates a socket through which a TLS client connection can be created,
+     * using the default network stack and the supplied credentials.
+     * Typically these should contain enough information
+     * to validate the remote certificate (i.e. trust info).
+     *
+     * \param options Optional additional session configuration
+     */
     /// @{
-    future<connected_socket> wrap_client(shared_ptr<certificate_credentials>, connected_socket&&, sstring name = {});
+    ::seastar::socket socket(shared_ptr<certificate_credentials>, tls_options options = {});
+    /// @}
+
+    /**
+     * Wraps an existing connection in SSL/TLS.
+     *
+     * ATTN: The method is going to be deprecated
+     *
+     * \param name The expected server name for the remote end point
+     */
+    /// @{
+    [[deprecated("Use overload with tls_options parameter")]]
+    future<connected_socket> wrap_client(shared_ptr<certificate_credentials>, connected_socket&&, sstring name);
     future<connected_socket> wrap_server(shared_ptr<server_credentials>, connected_socket&&);
+    /// @}
+
+    /**
+     * Wraps an existing connection in SSL/TLS.
+     *
+     * \param options Optional additional session configuration
+     */
+    /// @{
+    future<connected_socket> wrap_client(shared_ptr<certificate_credentials>, connected_socket&&, tls_options options = {});
     /// @}
 
     /**
@@ -341,6 +457,157 @@ namespace tls {
     // Wraps an existing server socket in SSL
     server_socket listen(shared_ptr<server_credentials>, server_socket);
     /// @}
+
+    /**
+     * Get distinguished name from the leaf certificate in the certificate chain that
+     * the connected peer is using.
+     * This function forces the TLS handshake. If the handshake didn't happen before the
+     * call to 'get_dn_information' it will be completed when the returned future will become
+     * ready.
+     * The function returns DN information on success. If the peer didn't send the certificate
+     * during the handshake the function returns nullopt. If the socket is not connected the
+     * system_error exception will be thrown.
+     */
+    future<std::optional<session_dn>> get_dn_information(connected_socket& socket);
+
+    /**
+     * Subject alt name types.
+    */
+    enum class subject_alt_name_type {
+        dnsname = 1, // string value representing a 'DNS' entry
+        rfc822name, // string value representing an 'email' entry
+        uri, // string value representing an 'uri' entry
+        ipaddress, // inet_address value representing an 'IP' entry
+        othername, // string value
+        dn, // string value
+    };
+
+    // Subject alt name entry
+    struct subject_alt_name {
+        using value_type = std::variant<
+            sstring,
+            net::inet_address
+        >;
+        subject_alt_name_type type;
+        value_type value;
+    };
+
+    /**
+     * Returns the alt name entries of matching types, or all entries if 'types' is empty
+     * The values are extracted from the client authentication certificate, if available.
+     * If no certificate authentication is used in the connection, en empty list is returned.
+     *
+     * If the socket is not connected a system_error exception will be thrown.
+     * If the socket is not a TLS socket an exception will be thrown.
+    */
+    future<std::vector<subject_alt_name>> get_alt_name_information(connected_socket& socket, std::unordered_set<subject_alt_name_type> types = {});
+
+    using certificate_data = std::vector<uint8_t>;
+
+    /**
+     * Get the raw certificate (chain) that the connected peer is using.
+     * This function forces the TLS handshake. If the handshake didn't happen before the
+     * call to 'get_peer_certificate_chain' it will be completed when the returned future
+     * will become ready.
+     * The function returns the certificate chain on success. If the peer didn't send the
+     * certificate during the handshake, the function returns an empty certificate chain.
+     * If the socket is not connected the system_error exception will be thrown.
+     */
+    future<std::vector<certificate_data>> get_peer_certificate_chain(connected_socket& socket);
+
+    /**
+     * Checks if the socket was connected using session resume.
+     * Will force handshake if not already done.
+     *
+     * If the socket is not connected a system_error exception will be thrown.
+     * If the socket is not a TLS socket an exception will be thrown.
+    */
+    future<bool> check_session_is_resumed(connected_socket& socket);
+
+    /**
+     * Get session resume data from a connected client socket. Will force handshake if not already done.
+     *
+     * If the socket is not connected a system_error exception will be thrown.
+     * If the socket is not a TLS socket an exception will be thrown.
+     * If no session resumption data is available, returns empty buffer.
+     *
+     * Note: TLS13 session tickets most of the time require data to have been transferred
+     * between client/server. To ensure getting the session data, it is advisable to
+     * delay this call to sometime before shutting down/closing the socket.
+    */
+    future<session_data> get_session_resume_data(connected_socket&);
+
+    std::ostream& operator<<(std::ostream&, const subject_alt_name::value_type&);
+    std::ostream& operator<<(std::ostream&, const subject_alt_name&);
+
+    /**
+     * Alt name to string.
+     * Note: because naming of alternative names is inconsistent between tools,
+     * and because openssl is probably more popular when creating certs anyway,
+     * this routine will be inconsistent with both gnutls and openssl (though more
+     * in line with the latter) and name the constants as follows:
+     *
+     * dnsname: "DNS"
+     * rfc822name: "EMAIL"
+     * uri: "URI"
+     * ipaddress "IP"
+     * othername: "OTHERNAME"
+     * dn: "DIRNAME"
+    */
+    std::string_view format_as(subject_alt_name_type);
+    std::ostream& operator<<(std::ostream&, subject_alt_name_type);
+
+    /**
+     * Error handling.
+     *
+     * The error_category instance used by exceptions thrown by TLS
+     */
+    const std::error_category& error_category();
+
+    /**
+     * The more common error codes encountered in TLS.
+     * Not an exhaustive list. Add exports as needed.
+     */
+    extern const int ERROR_UNKNOWN_COMPRESSION_ALGORITHM;
+    extern const int ERROR_UNKNOWN_CIPHER_TYPE;
+    extern const int ERROR_INVALID_SESSION;
+    extern const int ERROR_UNEXPECTED_HANDSHAKE_PACKET;
+    extern const int ERROR_UNKNOWN_CIPHER_SUITE;
+    extern const int ERROR_UNKNOWN_ALGORITHM;
+    extern const int ERROR_UNSUPPORTED_SIGNATURE_ALGORITHM;
+    extern const int ERROR_SAFE_RENEGOTIATION_FAILED;
+    extern const int ERROR_UNSAFE_RENEGOTIATION_DENIED;
+    extern const int ERROR_UNKNOWN_SRP_USERNAME;
+    extern const int ERROR_PREMATURE_TERMINATION;
+    extern const int ERROR_PUSH;
+    extern const int ERROR_PULL;
+    extern const int ERROR_UNEXPECTED_PACKET;
+    extern const int ERROR_UNSUPPORTED_VERSION;
+    extern const int ERROR_NO_CIPHER_SUITES;
+    extern const int ERROR_DECRYPTION_FAILED;
+    extern const int ERROR_MAC_VERIFY_FAILED;
 }
 }
 
+template <> struct fmt::formatter<seastar::tls::subject_alt_name_type> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(seastar::tls::subject_alt_name_type type, FormatContext& ctx) const {
+        return formatter<string_view>::format(format_as(type), ctx);
+    }
+};
+
+template <> struct fmt::formatter<seastar::tls::subject_alt_name::value_type> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const seastar::tls::subject_alt_name::value_type& value, FormatContext& ctx) const {
+        return std::visit([&](const auto& v) {
+            return fmt::format_to(ctx.out(), "{}", v);
+        }, value);
+    }
+};
+
+template <> struct fmt::formatter<seastar::tls::subject_alt_name> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const seastar::tls::subject_alt_name& name, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}={}", name.type, name.value);
+    }
+};

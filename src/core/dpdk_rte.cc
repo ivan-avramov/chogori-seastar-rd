@@ -30,12 +30,13 @@ namespace dpdk {
 
 bool eal::initialized = false;
 
-void eal::init(cpuset cpus, boost::program_options::variables_map opts)
+void eal::init(cpuset cpus, const std::string& argv0, const std::optional<std::string>& hugepages_path, bool dpdk_pmd)
 {
     if (initialized) {
         return;
     }
 
+    size_t cpu_count = cpus.count();
     std::stringstream mask;
     cpuset nibble = 0xF;
     while (cpus.any()) {
@@ -46,44 +47,35 @@ void eal::init(cpuset cpus, boost::program_options::variables_map opts)
     std::string mask_str = mask.str();
     std::reverse(mask_str.begin(), mask_str.end());
 
-    // TODO: Inherit these from the app parameters - "opts"
     std::vector<std::vector<char>> args {
-        string2vector(opts["argv0"].as<std::string>()),
+        string2vector(argv0),
         string2vector("-c"), string2vector(mask_str),
         string2vector("--no-hpet"),
-        // TODO get these from configuration
-        string2vector("-n"), string2vector("4"),
+
+        string2vector("-n"), string2vector("1"), // DPDK TODO chogori value was 4
         string2vector("-d"), string2vector("librte_pmd_mlx5.so")
     };
-
-    std::optional<std::string> hugepages_path;
-    if (opts.count("hugepages")) {
-        hugepages_path = opts["hugepages"].as<std::string>();
-    }
 
     // If "hugepages" is not provided and DPDK PMD drivers mode is requested -
     // use the default DPDK huge tables configuration.
     if (hugepages_path) {
-        //args.push_back(string2vector("--huge-dir"));
-        //args.push_back(string2vector(hugepages_path.value()));
+        args.push_back(string2vector("--huge-dir"));
+        args.push_back(string2vector(hugepages_path.value()));
 
         //
         // We don't know what is going to be our networking configuration so we
         // assume there is going to be a queue per-CPU. Plus we'll give a DPDK
         // 64MB for "other stuff".
         //
-        size_t size_MB = mem_size(cpus.count()) >> 20;
+        size_t size_MB = mem_size(cpu_count) >> 20;
         std::stringstream size_MB_str;
         size_MB_str << size_MB;
 
         args.push_back(string2vector("-m"));
         args.push_back(string2vector(size_MB_str.str()));
-    } else if (!opts.count("dpdk-pmd")) {
+    } else if (!dpdk_pmd) {
         args.push_back(string2vector("--no-huge"));
     }
-#ifdef HAVE_OSV
-    args.push_back(string2vector("--no-shconf"));
-#endif
 
     std::vector<char*> cargs;
 

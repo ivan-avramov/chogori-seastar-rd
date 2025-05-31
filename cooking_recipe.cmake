@@ -110,7 +110,7 @@ cooking_ingredient (nettle
     BUILD_COMMAND <DISABLE>
     INSTALL_COMMAND ${make_command} install)
 
-# Also a direct dependency of Seastar.
+# A dependency of DPDK.
 cooking_ingredient (numactl
   EXTERNAL_PROJECT_ARGS
     URL https://github.com/numactl/numactl/releases/download/v2.0.12/numactl-2.0.12.tar.gz
@@ -121,8 +121,8 @@ cooking_ingredient (numactl
 
 cooking_ingredient (zlib
   EXTERNAL_PROJECT_ARGS
-    URL https://zlib.net/zlib-1.2.11.tar.gz
-    URL_MD5 1c9f62f0778697a09d36121ead88e08e
+    URL https://github.com/madler/zlib/releases/download/v1.2.13/zlib-1.2.13.tar.gz
+    URL_MD5 9b8aa094c4e5765dabf4da391f00d15c
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
     BUILD_COMMAND <DISABLE>
     INSTALL_COMMAND ${make_command} install)
@@ -131,15 +131,38 @@ cooking_ingredient (zlib
 ## Private and private/public dependencies.
 ##
 
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set (boost_toolset gcc)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  set (boost_toolset clang)
+else ()
+  set(boost_toolset "cook_cxx")
+endif ()
+set (boost_user_config "${CMAKE_CURRENT_BINARY_DIR}/cook_boost.jam")
+if (CMAKE_C_FLAGS)
+  string (JOIN " <cflags>" boost_cflags
+    "<cflags>${CMAKE_C_FLAGS}")
+endif ()
+if (CMAKE_CXX_FLAGS)
+  string (JOIN " <cxxflags>" boost_cxxflags
+    "<cxxflags>${CMAKE_CXX_FLAGS}")
+endif ()
+file (WRITE "${boost_user_config}"
+  "using ${boost_toolset}"
+  " : " # toolset's version
+  " : ${CMAKE_CXX_COMPILER}"
+  " : ${boost_cflags}${boost_cxxflags} <cxxflags>-std=c++${CMAKE_CXX_STANDARD}"
+  " ;\n")
+
 cooking_ingredient (Boost
   EXTERNAL_PROJECT_ARGS
-    # The 1.67.0 release has a bug in Boost Lockfree around a missing header.
-    URL https://dl.bintray.com/boostorg/release/1.64.0/source/boost_1_64_0.tar.gz
-    URL_MD5 319c6ffbbeccc366f14bb68767a6db79
+    URL https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.bz2
+    URL_HASH SHA256=71feeed900fbccca04a3b4f2f84a7c217186f28a940ed8b7ed4725986baf99fa
     PATCH_COMMAND
       ./bootstrap.sh
       --prefix=<INSTALL_DIR>
       --with-libraries=atomic,chrono,date_time,filesystem,program_options,system,test,thread
+      --with-toolset=${boost_toolset}
     CONFIGURE_COMMAND <DISABLE>
     BUILD_COMMAND <DISABLE>
     INSTALL_COMMAND
@@ -148,7 +171,9 @@ cooking_ingredient (Boost
       -j ${build_concurrency_factor}
       --layout=system
       --build-dir=<BINARY_DIR>
+      --user-config=${boost_user_config}
       install
+      toolset=${boost_toolset}
       variant=debug
       link=shared
       threading=multi
@@ -180,11 +205,10 @@ cooking_ingredient (GnuTLS
 cooking_ingredient (Protobuf
   REQUIRES zlib
   EXTERNAL_PROJECT_ARGS
-    URL https://github.com/protocolbuffers/protobuf/releases/download/v3.3.0/protobuf-cpp-3.3.0.tar.gz
-    URL_MD5 73c28d3044e89782bdc8d9fdcfbb5792
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR> --srcdir=<SOURCE_DIR>
-    BUILD_COMMAND <DISABLE>
-    INSTALL_COMMAND ${make_command} install)
+    URL https://github.com/protocolbuffers/protobuf/releases/download/v21.11//protobuf-cpp-3.21.11.tar.gz
+    URL_MD5 e2cf711edae444bba0da199bc034e031
+  CMAKE_ARGS
+    -Dprotobuf_BUILD_TESTS=OFF)
 
 cooking_ingredient (hwloc
   REQUIRES
@@ -225,13 +249,12 @@ cooking_ingredient (lksctp-tools
     INSTALL_COMMAND ${make_command} install)
 
 cooking_ingredient (yaml-cpp
-  REQUIRES Boost
   CMAKE_ARGS
     -DYAML_CPP_BUILD_TESTS=OFF
-    -DBUILD_SHARED_LIBS=ON
+    -DYAML_BUILD_SHARED_LIBS=ON
   EXTERNAL_PROJECT_ARGS
-    URL https://github.com/jbeder/yaml-cpp/archive/yaml-cpp-0.5.3.tar.gz
-    URL_MD5 2bba14e6a7f12c7272f87d044e4a7211)
+    URL https://github.com/jbeder/yaml-cpp/archive/yaml-cpp-0.7.0.tar.gz
+    URL_MD5 74d646a3cc1b5d519829441db96744f0)
 
 ##
 ## Public dependencies.
@@ -239,62 +262,70 @@ cooking_ingredient (yaml-cpp
 
 cooking_ingredient (c-ares
   EXTERNAL_PROJECT_ARGS
-    URL https://c-ares.haxx.se/download/c-ares-1.13.0.tar.gz
-    URL_MD5 d2e010b43537794d8bedfb562ae6bba2
+    URL https://github.com/c-ares/c-ares/releases/download/v1.32.3/c-ares-1.32.3.tar.gz
+    URL_MD5 d5ed5967bc3a74191c051ce81ffe02fc
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR> --srcdir=<SOURCE_DIR>
     BUILD_COMMAND <DISABLE>
     INSTALL_COMMAND ${make_command} install)
 
-cooking_ingredient (cryptopp
-  CMAKE_ARGS
-    -DCMAKE_INSTALL_LIBDIR=<INSTALL_DIR>/lib
-    -DBUILD_TESTING=OFF
-  EXTERNAL_PROJECT_ARGS
-    URL https://github.com/weidai11/cryptopp/archive/CRYPTOPP_5_6_5.tar.gz
-    URL_MD5 88224d9c0322f63aa1fb5b8ae78170f0)
-
-
-# Use the "native" profile that DPDK defines in `dpdk/config`, but in `dpdk_configure.cmake` we override
-# CONFIG_RTE_MACHINE with `Seastar_DPDK_MACHINE`.
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-  set (dpdk_quadruple arm64-armv8a-linuxapp-gcc)
-else()
-  set (dpdk_quadruple ${CMAKE_SYSTEM_PROCESSOR}-native-linuxapp-gcc)
-endif()
-
 set (dpdk_args
-  # gcc 10 defaults to -fno-common, which dpdk is not prepared for
-  "EXTRA_CFLAGS=-Wno-error -fcommon"
-  O=<BINARY_DIR>
-  DESTDIR=<INSTALL_DIR>
-  T=${dpdk_quadruple})
+  --default-library=static
+  -Dc_args="-Wno-error"
+  -Denable_docs=false
+  -Denable_apps=dpdk-testpmd
+  -Dtests=false
+  -Dexamples=
+  -Dmbuf_refcnt_atomic=false
+  -Dmax_memseg_lists=8192
+  -Ddisable_drivers="net/softnic,net/bonding"
+  -Ddisable_libs="jobstats,power,port,table,pipeline,member"
+  -Dcpu_instruction_set=${Seastar_DPDK_MACHINE})
+
+if (CMAKE_BUILD_TYPE STREQUAL Debug)
+  list (APPEND dpdk_args -Dbuildtype=debug)
+endif ()
+
+find_program (Meson_EXECUTABLE
+  meson)
+if (NOT Meson_EXECUTABLE)
+  message (FATAL_ERROR "Cooking: Meson is required!")
+endif ()
+
+find_program (Ninja_EXECUTABLE
+  ninja)
+if (NOT Ninja_EXECUTABLE)
+  message (FATAL_ERROR "Cooking: Ninja is required!")
+endif ()
 
 cooking_ingredient (dpdk
   EXTERNAL_PROJECT_ARGS
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dpdk
     CONFIGURE_COMMAND
-      COMMAND
-        ${CMAKE_COMMAND} -E chdir <SOURCE_DIR>
-        make ${dpdk_args} config
-      COMMAND
-        ${CMAKE_COMMAND}
-        -DSeastar_DPDK_MACHINE=${Seastar_DPDK_MACHINE}
-        -DSeastar_DPDK_CONFIG_FILE_IN=<BINARY_DIR>/.config
-        -DSeastar_DPDK_CONFIG_FILE_CHANGES=${CMAKE_CURRENT_SOURCE_DIR}/dpdk_config
-        -DSeastar_DPDK_CONFIG_FILE_OUT=<BINARY_DIR>/${dpdk_quadruple}/.config
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dpdk_configure.cmake
-    BUILD_COMMAND <DISABLE>
+      env CC=${CMAKE_C_COMPILER} ${Meson_EXECUTABLE} setup ${dpdk_args} --prefix=<INSTALL_DIR> <BINARY_DIR> <SOURCE_DIR>
+    BUILD_COMMAND
+      ${Ninja_EXECUTABLE} -C <BINARY_DIR>
     INSTALL_COMMAND
-      ${CMAKE_COMMAND} -E chdir <SOURCE_DIR>
-      ${make_command} ${dpdk_args} install)
+      ${Ninja_EXECUTABLE} -C <BINARY_DIR> install)
 
 cooking_ingredient (fmt
   EXTERNAL_PROJECT_ARGS
-    URL https://github.com/fmtlib/fmt/archive/5.2.1.tar.gz
-    URL_MD5 eaf6e3c1b2f4695b9a612cedf17b509d
+    URL https://github.com/fmtlib/fmt/archive/9.1.0.tar.gz
+    URL_MD5 21fac48cae8f3b4a5783ae06b443973a
   CMAKE_ARGS
     -DFMT_DOC=OFF
     -DFMT_TEST=OFF)
+
+cooking_ingredient (liburing
+  EXTERNAL_PROJECT_ARGS
+    URL https://github.com/axboe/liburing/archive/liburing-2.1.tar.gz
+    URL_MD5 78f13d9861b334b9a9ca0d12cf2a6d3c
+    CONFIGURE_COMMAND
+      ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER}
+      <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
+    BUILD_COMMAND <DISABLE>
+    BUILD_BYPRODUCTS "<SOURCE_DIR>/src/liburing.a"
+    BUILD_IN_SOURCE ON
+    INSTALL_COMMAND ${make_command} -s install)
 
 cooking_ingredient (lz4
   EXTERNAL_PROJECT_ARGS

@@ -20,11 +20,14 @@
  */
 
 #include "loopback_socket.hh"
+#include "seastar/core/condition-variable.hh"
+#include "seastar/core/temporary_buffer.hh"
 #include <seastar/rpc/rpc.hh>
 #include <seastar/rpc/rpc_types.hh>
 #include <seastar/rpc/lz4_compressor.hh>
 #include <seastar/rpc/lz4_fragmented_compressor.hh>
 #include <seastar/rpc/multi_algo_compressor_factory.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/testing/test_runner.hh>
@@ -32,8 +35,18 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/distributed.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/metrics_api.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
+#include <seastar/util/closeable.hh>
+#include <seastar/util/noncopyable_function.hh>
+#include <seastar/util/later.hh>
+#include <seastar/core/coroutine.hh>
+
+#include <boost/range/numeric.hpp>
+
+#include <span>
 
 using namespace seastar;
 
@@ -43,14 +56,14 @@ struct serializer {
 template <typename T, typename Output>
 inline
 void write_arithmetic_type(Output& out, T v) {
-    static_assert(std::is_arithmetic<T>::value, "must be arithmetic type");
+    static_assert(std::is_arithmetic_v<T>, "must be arithmetic type");
     return out.write(reinterpret_cast<const char*>(&v), sizeof(T));
 }
 
 template <typename T, typename Input>
 inline
 T read_arithmetic_type(Input& in) {
-    static_assert(std::is_arithmetic<T>::value, "must be arithmetic type");
+    static_assert(std::is_arithmetic_v<T>, "must be arithmetic type");
     T v;
     in.read(reinterpret_cast<char*>(&v), sizeof(T));
     return v;
@@ -94,42 +107,75 @@ inline sstring read(serializer, Input& in, rpc::type<sstring>) {
 using test_rpc_proto = rpc::protocol<serializer>;
 using make_socket_fn = std::function<seastar::socket ()>;
 
-struct rpc_loopback_error_injector : public loopback_error_injector {
-    int _x = 0;
-    bool server_rcv_error() override {
-        return _x++ >= 50;
+class rpc_loopback_error_injector : public loopback_error_injector {
+public:
+    struct config {
+        struct {
+            int limit = 0;
+            error kind = error::none;
+        private:
+            friend class rpc_loopback_error_injector;
+            int _x = 0;
+            error inject() {
+                return _x++ >= limit ? kind : error::none;
+            }
+        } server_rcv = {}, server_snd = {}, client_rcv = {}, client_snd = {};
+        error connect_kind = error::none;
+        std::chrono::microseconds connect_delay = std::chrono::microseconds(0);
+    };
+private:
+    config _cfg;
+public:
+    rpc_loopback_error_injector(config cfg) : _cfg(std::move(cfg)) {}
+
+    error server_rcv_error() override {
+        return _cfg.server_rcv.inject();
+    }
+
+    error server_snd_error() override {
+        return _cfg.server_snd.inject();
+    }
+
+    error client_rcv_error() override {
+        return _cfg.client_rcv.inject();
+    }
+
+    error client_snd_error() override {
+        return _cfg.client_snd.inject();
+    }
+
+    error connect_error() override {
+        return _cfg.connect_kind;
+    }
+
+    std::chrono::microseconds connect_delay() override {
+        return _cfg.connect_delay;
     }
 };
 
 class rpc_socket_impl : public ::net::socket_impl {
-    promise<connected_socket> _p;
-    bool _connect;
-    loopback_socket_impl _socket;
     rpc_loopback_error_injector _error_injector;
+    loopback_socket_impl _socket;
 public:
-    rpc_socket_impl(loopback_connection_factory& factory, bool connect, bool inject_error)
-            : _connect(connect),
+    rpc_socket_impl(loopback_connection_factory& factory, std::optional<rpc_loopback_error_injector::config> inject_error)
+            :
+              _error_injector(inject_error.value_or(rpc_loopback_error_injector::config{})),
               _socket(factory, inject_error ? &_error_injector : nullptr) {
     }
     virtual future<connected_socket> connect(socket_address sa, socket_address local, transport proto = transport::TCP) override {
-        return _connect ? _socket.connect(sa, local, proto) : _p.get_future();
+        return _socket.connect(sa, local, proto);
     }
     virtual void set_reuseaddr(bool reuseaddr) override {}
     virtual bool get_reuseaddr() const override { return false; };
     virtual void shutdown() override {
-        if (_connect) {
-            _socket.shutdown();
-        } else {
-            _p.set_exception(std::make_exception_ptr(std::system_error(ECONNABORTED, std::system_category())));
-        }
+        _socket.shutdown();
     }
 };
 
 struct rpc_test_config {
     rpc::resource_limits resource_limits = {};
     rpc::server_options server_options = {};
-    bool connect = true;
-    bool inject_error = false;
+    std::optional<rpc_loopback_error_injector::config> inject_error;
 };
 
 template<typename MsgType = int>
@@ -169,7 +215,7 @@ class rpc_test_env {
 
         future<> unregister_handler(MsgType t) {
             auto it = std::find(_handlers.begin(), _handlers.end(), t);
-            assert(it != _handlers.end());
+            SEASTAR_ASSERT(it != _handlers.end());
             _handlers.erase(it);
             return proto().unregister_handler(t);
         }
@@ -211,7 +257,7 @@ public:
         return do_with(std::move(cfg), [func, co = std::move(co)] (rpc_test_env<MsgType>& env) {
             return seastar::async([&env, func, co = std::move(co)] {
                 test_rpc_proto::client cl(env.proto(), co, env.make_socket(), ipv4_addr());
-                auto stop = defer([&] { cl.stop().get(); });
+                auto stop = deferred_stop(cl);
                 func(env, cl);
             });
         });
@@ -222,7 +268,7 @@ public:
     }
 
     auto make_socket() {
-        return seastar::socket(std::make_unique<rpc_socket_impl>(_lcf, _cfg.connect, _cfg.inject_error));
+        return seastar::socket(std::make_unique<rpc_socket_impl>(_lcf, _cfg.inject_error));
     };
 
     test_rpc_proto& proto() {
@@ -298,6 +344,7 @@ SEASTAR_TEST_CASE(test_rpc_connect) {
 
     for (auto i = 0; i < 2; i++) {
         for (auto j = 0; j < 4; j++) {
+          for (bool with_delay : { true, false }) {
             auto factory = std::make_unique<cfactory>();
             rpc::server_options so;
             rpc::client_options co;
@@ -308,6 +355,7 @@ SEASTAR_TEST_CASE(test_rpc_connect) {
                 co.compressor_factory = factory.get();
             }
             co.send_timeout_data = j & 2;
+            co.send_handler_duration = with_delay;
             rpc_test_config cfg;
             cfg.server_options = so;
             auto f = rpc_test_env<>::do_with_thread(cfg, co, [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
@@ -315,7 +363,7 @@ SEASTAR_TEST_CASE(test_rpc_connect) {
                     return make_ready_future<int>(a+b);
                 }).get();
                 auto sum = env.proto().make_client<int (int, int)>(1);
-                auto result = sum(c1, 2, 3).get0();
+                auto result = sum(c1, 2, 3).get();
                 BOOST_REQUIRE_EQUAL(result, 2 + 3);
             }).handle_exception([] (auto ep) {
                 BOOST_FAIL("No exception expected");
@@ -327,6 +375,7 @@ SEASTAR_TEST_CASE(test_rpc_connect) {
                 }
             });
             fs.emplace_back(std::move(f));
+          }
         }
     }
     return when_all(fs.begin(), fs.end()).discard_result();
@@ -348,7 +397,7 @@ SEASTAR_TEST_CASE(test_rpc_connect_multi_compression_algo) {
             return make_ready_future<int>(a+b);
         }).get();
         auto sum = env.proto().make_client<int (int, int)>(1);
-        auto result = sum(c1, 2, 3).get0();
+        auto result = sum(c1, 2, 3).get();
         BOOST_REQUIRE_EQUAL(result, 2 + 3);
     }).finally([factory1 = std::move(factory1), factory2 = std::move(factory2)] {
         BOOST_REQUIRE_EQUAL(factory1->use_compression, 0);
@@ -358,14 +407,21 @@ SEASTAR_TEST_CASE(test_rpc_connect_multi_compression_algo) {
 
 SEASTAR_TEST_CASE(test_rpc_connect_abort) {
     rpc_test_config cfg;
-    cfg.connect = false;
+    rpc_loopback_error_injector::config ecfg;
+    ecfg.connect_kind = loopback_error_injector::error::abort;
+    cfg.inject_error = ecfg;
     return rpc_test_env<>::do_with_thread(cfg, [] (rpc_test_env<>& env) {
         test_rpc_proto::client c1(env.proto(), {}, env.make_socket(), ipv4_addr());
         env.register_handler(1, []() { return make_ready_future<>(); }).get();
         auto f = env.proto().make_client<void ()>(1);
-        c1.stop().get0();
+        auto fut = f(c1);
+        c1.stop().get();
         try {
-            f(c1).get0();
+            fut.get();
+            BOOST_REQUIRE(false);
+        } catch (...) {}
+        try {
+            f(c1).get();
             BOOST_REQUIRE(false);
         } catch (...) {}
     });
@@ -382,10 +438,13 @@ SEASTAR_TEST_CASE(test_rpc_cancel) {
             handler_called.set_value(); rpc_executed = true; return sleep(1ms);
         }).get();
         auto call = env.proto().make_client<void ()>(1);
+        promise<> cont;
         rpc::cancellable cancel;
+        c1.suspend_for_testing(cont);
         auto f = call(c1, cancel);
         // cancel send side
         cancel.cancel();
+        cont.set_value();
         try {
             f.get();
         } catch(rpc::canceled_error&) {
@@ -425,6 +484,17 @@ SEASTAR_TEST_CASE(test_message_to_big) {
     });
 }
 
+SEASTAR_TEST_CASE(test_rpc_remote_verb_error) {
+    rpc_test_config cfg;
+    return rpc_test_env<>::do_with_thread(cfg, [] (rpc_test_env<>& env) {
+        test_rpc_proto::client c1(env.proto(), {}, env.make_socket(), ipv4_addr());
+        env.register_handler(1, []() { throw std::runtime_error("error"); }).get();
+        auto f = env.proto().make_client<void ()>(1);
+        BOOST_REQUIRE_THROW(f(c1).get(), rpc::remote_verb_error);
+        c1.stop().get();
+    });
+}
+
 struct stream_test_result {
     bool client_source_closed = false;
     bool server_source_closed = false;
@@ -433,11 +503,13 @@ struct stream_test_result {
     bool source_done_exception = false;
     bool server_done_exception = false;
     bool client_stop_exception = false;
+    bool server_stop_exception = false;
     int server_sum = 0;
+    bool exception_while_creating_sink = false;
 };
 
-future<stream_test_result> stream_test_func(rpc_test_env<>& env, bool stop_client, bool expect_connection_error = false) {
-    return seastar::async([&env, stop_client, expect_connection_error] {
+future<stream_test_result> stream_test_func(rpc_test_env<>& env, bool stop_client, bool stop_server, bool expect_connection_error = false) {
+    return seastar::async([&env, stop_client, stop_server, expect_connection_error] {
         stream_test_result r;
         test_rpc_proto::client c(env.proto(), {}, env.make_socket(), ipv4_addr());
         future<> server_done = make_ready_future();
@@ -457,7 +529,7 @@ future<stream_test_result> stream_test_func(rpc_test_env<>& env, bool stop_clien
 
             auto source_loop = seastar::async([source, &r] () mutable {
                 while (!r.server_source_closed) {
-                    auto data = source().get0();
+                    auto data = source().get();
                     if (data) {
                         r.server_sum += std::get<0>(*data);
                     } else {
@@ -478,54 +550,68 @@ future<stream_test_result> stream_test_func(rpc_test_env<>& env, bool stop_clien
             return sink;
         }).get();
         auto call = env.proto().make_client<rpc::source<sstring> (int, rpc::sink<int>)>(1);
+        struct failed_to_create_sync{};
         auto x = [&] {
             try {
-                return c.make_stream_sink<serializer, int>(env.make_socket()).get0();
+                return c.make_stream_sink<serializer, int>(env.make_socket()).get();
             } catch (...) {
                 c.stop().get();
-                throw;
+                throw failed_to_create_sync{};
             }
         };
-        auto sink = x();
-        auto source = call(c, 666, sink).get0();
-        auto source_done = seastar::async([&] {
-            while (!r.client_source_closed) {
-                auto data = source().get0();
-                if (data) {
-                    BOOST_REQUIRE_EQUAL(std::get<0>(*data), "seastar");
-                } else {
-                    r.client_source_closed = true;
+        try {
+            auto sink = x();
+            auto source = call(c, 666, sink).get();
+            auto source_done = seastar::async([&] {
+                while (!r.client_source_closed) {
+                    auto data = source().get();
+                    if (data) {
+                        BOOST_REQUIRE_EQUAL(std::get<0>(*data), "seastar");
+                    } else {
+                        r.client_source_closed = true;
+                    }
+                }
+            });
+            auto check_exception = [] (auto f) {
+                try {
+                    f.get();
+                } catch (...) {
+                    return true;
+                }
+                return false;
+            };
+            future<> stop_client_future = make_ready_future();
+            future<> stop_server_future = make_ready_future();
+            // With a connection error sink() will eventually fail, but we
+            // cannot guarantee when.
+            int max = expect_connection_error ? std::numeric_limits<int>::max()  : 101;
+            for (int i = 1; i < max; i++) {
+                if (i == 50) {
+                    if (stop_client) {
+                        // stop client while stream is in use
+                        stop_client_future = c.stop();
+                    }
+                    if (stop_server) {
+                        // stop server while stream is in use
+                        stop_server_future = env.server().shutdown();
+                    }
+                }
+                sleep(std::chrono::milliseconds(1)).get();
+                r.sink_exception = check_exception(sink(i));
+                if (r.sink_exception) {
+                    break;
                 }
             }
-        });
-        auto check_exception = [] (auto f) {
-            try {
-                f.get();
-            } catch (...) {
-                return true;
-            }
-            return false;
-        };
-        future<> stop_client_future = make_ready_future();
-        // With a connection error sink() will eventually fail, but we
-        // cannot guarantee when.
-        int max = expect_connection_error ? std::numeric_limits<int>::max()  : 101;
-        for (int i = 1; i < max; i++) {
-            if (stop_client && i == 50) {
-                // stop client while stream is in use
-                stop_client_future = c.stop();
-            }
-            sleep(std::chrono::milliseconds(1)).get();
-            r.sink_exception = check_exception(sink(i));
-            if (r.sink_exception) {
-                break;
-            }
+            r.sink_close_exception = check_exception(sink.close());
+            r.source_done_exception = check_exception(std::move(source_done));
+            r.server_done_exception = check_exception(std::move(server_done));
+            r.client_stop_exception = check_exception(!stop_client ? c.stop() : std::move(stop_client_future));
+            r.server_stop_exception = check_exception(!stop_server ? make_ready_future<>() : std::move(stop_server_future));
+            return r;
+        } catch(failed_to_create_sync&) {
+            r.exception_while_creating_sink = true;
+            return r;
         }
-        r.sink_close_exception = check_exception(sink.close());
-        r.source_done_exception = check_exception(std::move(source_done));
-        r.server_done_exception = check_exception(std::move(server_done));
-        r.client_stop_exception = check_exception(!stop_client ? c.stop() : std::move(stop_client_future));
-        return r;
     });
 }
 
@@ -535,7 +621,7 @@ SEASTAR_TEST_CASE(test_stream_simple) {
     rpc_test_config cfg;
     cfg.server_options = so;
     return rpc_test_env<>::do_with(cfg, [] (rpc_test_env<>& env) {
-        return stream_test_func(env, false).then([] (stream_test_result r) {
+        return stream_test_func(env, false, false).then([] (stream_test_result r) {
             BOOST_REQUIRE(r.client_source_closed);
             BOOST_REQUIRE(r.server_source_closed);
             BOOST_REQUIRE(r.server_sum == 5050);
@@ -554,7 +640,7 @@ SEASTAR_TEST_CASE(test_stream_stop_client) {
     rpc_test_config cfg;
     cfg.server_options = so;
     return rpc_test_env<>::do_with(cfg, [] (rpc_test_env<>& env) {
-        return stream_test_func(env, true).then([] (stream_test_result r) {
+        return stream_test_func(env, true, false).then([] (stream_test_result r) {
             BOOST_REQUIRE(!r.client_source_closed);
             BOOST_REQUIRE(!r.server_source_closed);
             BOOST_REQUIRE(r.sink_exception);
@@ -566,13 +652,11 @@ SEASTAR_TEST_CASE(test_stream_stop_client) {
     });
 }
 
-
-SEASTAR_TEST_CASE(test_stream_connection_error) {
+SEASTAR_TEST_CASE(test_stream_stop_server) {
     rpc::server_options so;
     so.streaming_domain = rpc::streaming_domain_type(1);
     rpc_test_config cfg;
     cfg.server_options = so;
-    cfg.inject_error = true;
     return rpc_test_env<>::do_with(cfg, [] (rpc_test_env<>& env) {
         return stream_test_func(env, false, true).then([] (stream_test_result r) {
             BOOST_REQUIRE(!r.client_source_closed);
@@ -582,27 +666,126 @@ SEASTAR_TEST_CASE(test_stream_connection_error) {
             BOOST_REQUIRE(r.source_done_exception);
             BOOST_REQUIRE(r.server_done_exception);
             BOOST_REQUIRE(!r.client_stop_exception);
+            BOOST_REQUIRE(!r.server_stop_exception);
         });
     });
 }
 
+SEASTAR_TEST_CASE(test_stream_connection_error) {
+    rpc::server_options so;
+    so.streaming_domain = rpc::streaming_domain_type(1);
+    rpc_test_config cfg;
+    cfg.server_options = so;
+    rpc_loopback_error_injector::config ecfg;
+    ecfg.server_rcv.limit = 50;
+    ecfg.server_rcv.kind = loopback_error_injector::error::abort;
+    cfg.inject_error = ecfg;
+    return rpc_test_env<>::do_with(cfg, [] (rpc_test_env<>& env) {
+        return stream_test_func(env, false, false, true).then([] (stream_test_result r) {
+            BOOST_REQUIRE(!r.client_source_closed);
+            BOOST_REQUIRE(!r.server_source_closed);
+            BOOST_REQUIRE(r.sink_exception);
+            BOOST_REQUIRE(r.sink_close_exception);
+            BOOST_REQUIRE(r.source_done_exception);
+            BOOST_REQUIRE(r.server_done_exception);
+            BOOST_REQUIRE(!r.client_stop_exception);
+        });
+    });
+}
+
+SEASTAR_TEST_CASE(test_stream_negotiation_error) {
+    rpc::server_options so;
+    so.streaming_domain = rpc::streaming_domain_type(1);
+    rpc_test_config cfg;
+    cfg.server_options = so;
+    rpc_loopback_error_injector::config ecfg;
+    ecfg.server_rcv.limit = 0;
+    ecfg.server_rcv.kind = loopback_error_injector::error::abort;
+    cfg.inject_error = ecfg;
+    return rpc_test_env<>::do_with(cfg, [] (rpc_test_env<>& env) {
+        return stream_test_func(env, false, false, true).then([] (stream_test_result r) {
+            BOOST_REQUIRE(r.exception_while_creating_sink);
+        });
+    });
+}
+
+static future<> test_rpc_connection_send_glitch(bool on_client) {
+    struct context {
+        int limit;
+        bool no_failures;
+        bool on_client;
+    };
+
+    return do_with(context{0, false, on_client}, [] (auto& ctx) {
+        return do_until([&ctx] {
+            return ctx.no_failures;
+        }, [&ctx] {
+            fmt::print("======== 8< ========\n");
+            fmt::print("  Checking {} limit\n", ctx.limit);
+            rpc_test_config cfg;
+            rpc_loopback_error_injector::config ecfg;
+            if (ctx.on_client) {
+                ecfg.client_snd.limit = ctx.limit;
+                ecfg.client_snd.kind = loopback_error_injector::error::one_shot;
+            } else {
+                ecfg.server_snd.limit = ctx.limit;
+                ecfg.server_snd.kind = loopback_error_injector::error::one_shot;
+            }
+            cfg.inject_error = ecfg;
+            return rpc_test_env<>::do_with_thread(cfg, [&ctx] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
+                env.register_handler(1, [] {
+                    fmt::print("  reply\n");
+                    return seastar::sleep(std::chrono::milliseconds(100)).then([] {
+                        return make_ready_future<unsigned>(13);
+                    });
+                }).get();
+
+                ctx.no_failures = true;
+
+                for (int i = 0; i < 4; i++) {
+                    auto call = env.proto().make_client<unsigned ()>(1);
+                    fmt::print("  call {}\n", i);
+                    try {
+                        auto id = call(c1).get();
+                        fmt::print("    response: {}\n", id);
+                    } catch (...) {
+                        fmt::print("    responce: ex {}\n", std::current_exception());
+                        ctx.no_failures = false;
+                        ctx.limit++;
+                        break;
+                    }
+                    seastar::yield().get();
+                }
+            });
+        });
+    });
+}
+
+SEASTAR_TEST_CASE(test_rpc_client_send_glitch) {
+    return test_rpc_connection_send_glitch(true);
+}
+
+SEASTAR_TEST_CASE(test_rpc_server_send_glitch) {
+    return test_rpc_connection_send_glitch(false);
+}
+
 SEASTAR_TEST_CASE(test_rpc_scheduling) {
     return rpc_test_env<>::do_with_thread(rpc_test_config(), [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
-        auto sg = create_scheduling_group("rpc", 100).get0();
+        auto sg = create_scheduling_group("rpc", 100).get();
         env.register_handler(1, sg, [] () {
             return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
         }).get();
         auto call_sg_id = env.proto().make_client<unsigned ()>(1);
-        auto id = call_sg_id(c1).get0();
+        auto id = call_sg_id(c1).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg));
     });
 }
 
 SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
-    auto sg1 = create_scheduling_group("sg1", 100).get0();
-    auto sg1_kill = defer([&] { destroy_scheduling_group(sg1).get(); });
-    auto sg2 = create_scheduling_group("sg2", 100).get0();
-    auto sg2_kill = defer([&] { destroy_scheduling_group(sg2).get(); });
+    auto sg1 = create_scheduling_group("sg1", 100).get();
+    auto sg1_kill = defer([&] () noexcept { destroy_scheduling_group(sg1).get(); });
+    auto sg2 = create_scheduling_group("sg2", 100).get();
+    auto sg2_kill = defer([&] () noexcept { destroy_scheduling_group(sg2).get(); });
     rpc::resource_limits limits;
     limits.isolate_connection = [sg1, sg2] (sstring cookie) {
         auto sg = current_scheduling_group();
@@ -629,9 +812,9 @@ SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
         }).get();
         auto call_sg_id = env.proto().make_client<unsigned ()>(1);
         unsigned id;
-        id = call_sg_id(c1).get0();
+        id = call_sg_id(c1).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
-        id = call_sg_id(c2).get0();
+        id = call_sg_id(c2).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
         c1.stop().get();
         c2.stop().get();
@@ -639,10 +822,10 @@ SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_compatibility) {
-    auto sg1 = create_scheduling_group("sg1", 100).get0();
-    auto sg1_kill = defer([&] { destroy_scheduling_group(sg1).get(); });
-    auto sg2 = create_scheduling_group("sg2", 100).get0();
-    auto sg2_kill = defer([&] { destroy_scheduling_group(sg2).get(); });
+    auto sg1 = create_scheduling_group("sg1", 100).get();
+    auto sg1_kill = defer([&] () noexcept { destroy_scheduling_group(sg1).get(); });
+    auto sg2 = create_scheduling_group("sg2", 100).get();
+    auto sg2_kill = defer([&] () noexcept { destroy_scheduling_group(sg2).get(); });
     rpc::resource_limits limits;
     limits.isolate_connection = [sg1, sg2] (sstring cookie) {
         auto sg = current_scheduling_group();
@@ -673,12 +856,155 @@ SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_compatibility) {
         }).get();
         auto call_sg_id = env.proto().make_client<unsigned ()>(1);
         unsigned id;
-        id = call_sg_id(c1).get0();
+        id = call_sg_id(c1).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
-        id = call_sg_id(c2).get0();
+        id = call_sg_id(c2).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
-        id = call_sg_id(c3).get0();
+        id = call_sg_id(c3).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
+        c1.stop().get();
+        c2.stop().get();
+        c3.stop().get();
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_async) {
+    scheduling_group sg1 = default_scheduling_group();
+    scheduling_group sg2 = default_scheduling_group();
+    auto sg1_kill = defer([&] () noexcept {
+        if (sg1 != default_scheduling_group())  {
+            destroy_scheduling_group(sg1).get();
+        }
+    });
+    auto sg2_kill = defer([&] () noexcept {
+        if (sg2 != default_scheduling_group()) {
+            destroy_scheduling_group(sg2).get();
+        }
+    });
+    rpc::resource_limits limits;
+    limits.isolate_connection = [&sg1, &sg2] (sstring cookie) {
+        future<seastar::scheduling_group> get_scheduling_group = make_ready_future<>().then([&sg1, &sg2, cookie] {
+            if (cookie == "sg1") {
+                if (sg1 == default_scheduling_group()) {
+                    return create_scheduling_group("sg1", 100).then([&sg1] (seastar::scheduling_group sg) {
+                        sg1 = sg;
+                        return sg;
+                    });
+                } else {
+                    return make_ready_future<seastar::scheduling_group>(sg1);
+                }
+            } else if (cookie == "sg2") {
+                if (sg2 == default_scheduling_group()) {
+                    return create_scheduling_group("sg2", 100).then([&sg2] (seastar::scheduling_group sg) {
+                        sg2 = sg;
+                        return sg;
+                    });
+                } else {
+                    return make_ready_future<seastar::scheduling_group>(sg2);
+                }
+            }
+            return make_ready_future<seastar::scheduling_group>(current_scheduling_group());
+        });
+
+        return get_scheduling_group.then([] (scheduling_group sg) {
+            rpc::isolation_config cfg;
+            cfg.sched_group = sg;
+            return cfg;
+        });
+    };
+    rpc_test_config cfg;
+    cfg.resource_limits = limits;
+    rpc_test_env<>::do_with_thread(cfg, [&sg1, &sg2] (rpc_test_env<>& env) {
+        rpc::client_options co1;
+        co1.isolation_cookie = "sg1";
+        test_rpc_proto::client c1(env.proto(), co1, env.make_socket(), ipv4_addr());
+        rpc::client_options co2;
+        co2.isolation_cookie = "sg2";
+        test_rpc_proto::client c2(env.proto(), co2, env.make_socket(), ipv4_addr());
+        env.register_handler(1, [] {
+            return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
+        }).get();
+        auto call_sg_id = env.proto().make_client<unsigned ()>(1);
+        unsigned id;
+        id = call_sg_id(c1).get();
+        BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
+        id = call_sg_id(c2).get();
+        BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
+        c1.stop().get();
+        c2.stop().get();
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_compatibility_async) {
+    scheduling_group sg1 = default_scheduling_group();
+    scheduling_group sg2 = default_scheduling_group();
+    scheduling_group sg3 = create_scheduling_group("sg3", 100).get();
+    auto sg1_kill = defer([&] () noexcept {
+        if (sg1 != default_scheduling_group())  {
+            destroy_scheduling_group(sg1).get();
+        }
+    });
+    auto sg2_kill = defer([&] () noexcept {
+        if (sg2 != default_scheduling_group()) {
+            destroy_scheduling_group(sg2).get();
+        }
+    });
+    auto sg3_kill = defer([&] () noexcept { destroy_scheduling_group(sg3).get(); });
+    rpc::resource_limits limits;
+    limits.isolate_connection = [&sg1, &sg2] (sstring cookie) {
+        future<seastar::scheduling_group> get_scheduling_group = make_ready_future<>().then([&sg1, &sg2, cookie] {
+            if (cookie == "sg1") {
+                if (sg1 == default_scheduling_group()) {
+                    return create_scheduling_group("sg1", 100).then([&sg1] (seastar::scheduling_group sg) {
+                        sg1 = sg;
+                        return sg;
+                    });
+                } else {
+                    return make_ready_future<seastar::scheduling_group>(sg1);
+                }
+            } else if (cookie == "sg2") {
+                if (sg2 == default_scheduling_group()) {
+                    return create_scheduling_group("sg2", 100).then([&sg2] (seastar::scheduling_group sg) {
+                        sg2 = sg;
+                        return sg;
+                    });
+                } else {
+                    return make_ready_future<seastar::scheduling_group>(sg2);
+                }
+            }
+            return make_ready_future<seastar::scheduling_group>(current_scheduling_group());
+        });
+
+        return get_scheduling_group.then([] (scheduling_group sg) {
+            rpc::isolation_config cfg;
+            cfg.sched_group = sg;
+            return cfg;
+        });
+    };
+    rpc_test_config cfg;
+    cfg.resource_limits = limits;
+    rpc_test_env<>::do_with_thread(cfg, [&sg1, &sg2, &sg3] (rpc_test_env<>& env) {
+        rpc::client_options co1;
+        co1.isolation_cookie = "sg1";
+        test_rpc_proto::client c1(env.proto(), co1, env.make_socket(), ipv4_addr());
+        rpc::client_options co2;
+        co2.isolation_cookie = "sg2";
+        test_rpc_proto::client c2(env.proto(), co2, env.make_socket(), ipv4_addr());
+        // An old client, that doesn't have an isolation cookie
+        rpc::client_options co3;
+        test_rpc_proto::client c3(env.proto(), co3, env.make_socket(), ipv4_addr());
+        // A server that uses sg3 if the client is old
+        env.register_handler(1, sg3, [] () {
+            return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
+        }).get();
+        auto call_sg_id = env.proto().make_client<unsigned ()>(1);
+        unsigned id;
+        id = call_sg_id(c1).get();
+        BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
+        id = call_sg_id(c2).get();
+        BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
+        id = call_sg_id(c3).get();
+        BOOST_REQUIRE(id == internal::scheduling_group_index(sg3));
         c1.stop().get();
         c2.stop().get();
         c3.stop().get();
@@ -739,18 +1065,22 @@ void test_compressor(std::function<std::unique_ptr<seastar::rpc::compressor>()> 
 
     auto compressor = compressor_factory();
 
-    std::vector<std::tuple<sstring, size_t, snd_buf>> inputs;
+    std::vector<noncopyable_function<std::tuple<sstring, size_t, snd_buf> ()>> inputs;
+
+    auto add_input = [&] (auto func_returning_tuple) {
+        inputs.emplace_back(std::move(func_returning_tuple));
+    };
 
     auto& eng = testing::local_random_engine;
-    auto dist = std::uniform_int_distribution<char>();
+    auto dist = std::uniform_int_distribution<int>(0, std::numeric_limits<char>::max());
 
     auto snd = snd_buf(1);
     *snd.front().get_write() = 'a';
-    inputs.emplace_back("one byte, no headroom", 0, std::move(snd));
+    add_input([snd = std::move(snd)] () mutable { return std::tuple(sstring("one byte, no headroom"), size_t(0), std::move(snd)); });
 
     snd = snd_buf(1);
     *snd.front().get_write() = 'a';
-    inputs.emplace_back("one byte, 128k of headroom", 128 * 1024, std::move(snd));
+    add_input([snd = std::move(snd)] () mutable { return std::tuple(sstring("one byte, 128k of headroom"), size_t(128 * 1024), std::move(snd)); });
 
     auto gen_fill = [&](size_t s, sstring msg, std::optional<size_t> split = {}) {
         auto buf = temporary_buffer<char>(s);
@@ -763,10 +1093,11 @@ void test_compressor(std::function<std::unique_ptr<seastar::rpc::compressor>()> 
         } else {
             snd.bufs = buf.clone();
         }
-        inputs.emplace_back(msg, 0, std::move(snd));
+        return std::tuple(msg, size_t(0), std::move(snd));
     };
 
-    gen_fill(16 * 1024, "single 16 kB buffer of \'a\'");
+
+    add_input(std::bind(gen_fill, 16 * 1024, "single 16 kB buffer of \'a\'"));
 
     auto gen_rand = [&](size_t s, sstring msg, std::optional<size_t> split = {}) {
         auto buf = temporary_buffer<char>(s);
@@ -779,10 +1110,10 @@ void test_compressor(std::function<std::unique_ptr<seastar::rpc::compressor>()> 
         } else {
             snd.bufs = buf.clone();
         }
-        inputs.emplace_back(msg, 0, std::move(snd));
+        return std::tuple(msg, size_t(0), std::move(snd));
     };
 
-    gen_rand(16 * 1024, "single 16 kB buffer of random");
+    add_input(std::bind(gen_rand, 16 * 1024, "single 16 kB buffer of random"));
 
     auto gen_text = [&](size_t s, sstring msg, std::optional<size_t> split = {}) {
         static const std::string_view text = "The quick brown fox wants bananas for his long term health but sneaks bacon behind his wife's back. ";
@@ -802,34 +1133,39 @@ void test_compressor(std::function<std::unique_ptr<seastar::rpc::compressor>()> 
         } else {
             snd.bufs = buf.clone();
         }
-        inputs.emplace_back(msg, 0, std::move(snd));
+        return std::tuple(msg, size_t(0), std::move(snd));
     };
 
+#ifndef SEASTAR_DEBUG
+    auto buffer_sizes = { 1, 4 };
+#else
+    auto buffer_sizes = { 1 };
+#endif
 
-    for (auto s : { 1, 4, 8 }) {
+    for (auto s : buffer_sizes) {
         for (auto ss : { 32, 64, 128, 48, 56, 246, 511 }) {
-            gen_fill(s * 1024 * 1024, format("{} MB buffer of \'a\' split into {} kB - {}", s, ss, ss), ss * 1024 - ss);
-            gen_fill(s * 1024 * 1024, format("{} MB buffer of \'a\' split into {} kB", s, ss), ss * 1024);
-            gen_rand(s * 1024 * 1024, format("{} MB buffer of random split into {} kB", s, ss), ss * 1024);
+            add_input(std::bind(gen_fill, s * 1024 * 1024, format("{} MB buffer of \'a\' split into {} kB - {}", s, ss, ss), ss * 1024 - ss));
+            add_input(std::bind(gen_fill, s * 1024 * 1024, format("{} MB buffer of \'a\' split into {} kB", s, ss), ss * 1024));
+            add_input(std::bind(gen_rand, s * 1024 * 1024, format("{} MB buffer of random split into {} kB", s, ss), ss * 1024));
 
-            gen_fill(s * 1024 * 1024 + 1, format("{} MB + 1B buffer of \'a\' split into {} kB", s, ss), ss * 1024);
-            gen_rand(s * 1024 * 1024 + 1, format("{} MB + 1B buffer of random split into {} kB", s, ss), ss * 1024);
+            add_input(std::bind(gen_fill, s * 1024 * 1024 + 1, format("{} MB + 1B buffer of \'a\' split into {} kB", s, ss), ss * 1024));
+            add_input(std::bind(gen_rand, s * 1024 * 1024 + 1, format("{} MB + 1B buffer of random split into {} kB", s, ss), ss * 1024));
         }
 
         for (auto ss : { 128, 246, 511, 3567, 2*1024, 8*1024 }) {
-            gen_fill(s * 1024 * 1024, format("{} MB buffer of \'a\' split into {} B", s, ss), ss);
-            gen_rand(s * 1024 * 1024, format("{} MB buffer of random split into {} B", s, ss), ss);
-            gen_text(s * 1024 * 1024, format("{} MB buffer of text split into {} B", s, ss), ss);
-            gen_fill(s * 1024 * 1024 - ss, format("{} MB - {}B buffer of \'a\' split into {} B", s, ss, ss), ss);
-            gen_rand(s * 1024 * 1024 - ss, format("{} MB - {}B buffer of random split into {} B", s, ss, ss), ss);
-            gen_text(s * 1024 * 1024 - ss, format("{} MB - {}B buffer of random split into {} B", s, ss, ss), ss);
+            add_input(std::bind(gen_fill, s * 1024 * 1024, format("{} MB buffer of \'a\' split into {} B", s, ss), ss));
+            add_input(std::bind(gen_rand, s * 1024 * 1024, format("{} MB buffer of random split into {} B", s, ss), ss));
+            add_input(std::bind(gen_text, s * 1024 * 1024, format("{} MB buffer of text split into {} B", s, ss), ss));
+            add_input(std::bind(gen_fill, s * 1024 * 1024 - ss, format("{} MB - {}B buffer of \'a\' split into {} B", s, ss, ss), ss));
+            add_input(std::bind(gen_rand, s * 1024 * 1024 - ss, format("{} MB - {}B buffer of random split into {} B", s, ss, ss), ss));
+            add_input(std::bind(gen_text, s * 1024 * 1024 - ss, format("{} MB - {}B buffer of random split into {} B", s, ss, ss), ss));
         }
     }
 
     for (auto s : { 64*1024 + 5670, 16*1024 + 3421, 32*1024 - 321 }) {
-        gen_fill(s, format("{} bytes buffer of \'a\'", s));
-        gen_rand(s, format("{} bytes buffer of random", s));
-        gen_text(s, format("{} bytes buffer of text", s));
+        add_input(std::bind(gen_fill, s, format("{} bytes buffer of \'a\'", s)));
+        add_input(std::bind(gen_rand, s, format("{} bytes buffer of random", s)));
+        add_input(std::bind(gen_text, s, format("{} bytes buffer of text", s)));
     }
 
     std::vector<std::tuple<sstring, std::function<rcv_buf(snd_buf)>>> transforms {
@@ -885,7 +1221,8 @@ void test_compressor(std::function<std::unique_ptr<seastar::rpc::compressor>()> 
         BOOST_CHECK_EQUAL(actual_size, buffer.size);
     };
 
-    for (auto& in : inputs) {
+    for (auto& in_func : inputs) {
+        auto in = in_func();
         BOOST_TEST_MESSAGE("Input: " << std::get<0>(in));
         auto headroom = std::get<1>(in);
         auto compressed = compressor->compress(headroom, clone(std::get<2>(in)));
@@ -968,7 +1305,7 @@ SEASTAR_TEST_CASE(test_max_absolute_timeout) {
         // catch the bug in #671 virtually every time.
         auto until = seastar::lowres_clock::now() + std::chrono::milliseconds(200);
         while (seastar::lowres_clock::now() <= until) {
-            auto result = sum(c1, rpc::rpc_clock_type::time_point::max(), 2, 3).get0();
+            auto result = sum(c1, rpc::rpc_clock_type::time_point::max(), 2, 3).get();
             BOOST_REQUIRE_EQUAL(result, 2 + 3);
         }
     }).then([success, done, abrt] {
@@ -1002,7 +1339,7 @@ SEASTAR_TEST_CASE(test_max_relative_timeout) {
         auto sum = env.proto().make_client<int (int, int)>(1);
         // The following call used to always hang, when max()+now()
         // overflowed and appeared to be a negative timeout.
-        auto result = sum(c1, rpc::rpc_clock_type::duration::max(), 2, 3).get0();
+        auto result = sum(c1, rpc::rpc_clock_type::duration::max(), 2, 3).get();
         BOOST_REQUIRE_EQUAL(result, 2 + 3);
     }).then([success, done, abrt] {
         *success = true;
@@ -1020,7 +1357,7 @@ SEASTAR_TEST_CASE(test_rpc_tuple) {
             return make_ready_future<rpc::tuple<int, long>>(rpc::tuple<int, long>(1, 0x7'0000'0000L));
         }).get();
         auto f1 = env.proto().make_client<rpc::tuple<int, long> ()>(1);
-        auto result = f1(c1).get0();
+        auto result = f1(c1).get();
         BOOST_REQUIRE_EQUAL(std::get<0>(result), 1);
         BOOST_REQUIRE_EQUAL(std::get<1>(result), 0x7'0000'0000L);
     });
@@ -1034,7 +1371,7 @@ SEASTAR_TEST_CASE(test_rpc_nonvariadic_client_variadic_server) {
         }).get();
         // Client is non-variadic
         auto f1 = env.proto().make_client<future<rpc::tuple<int, long>> ()>(1);
-        auto result = f1(c1).get0();
+        auto result = f1(c1).get();
         BOOST_REQUIRE_EQUAL(std::get<0>(result), 1);
         BOOST_REQUIRE_EQUAL(std::get<1>(result), 0x7'0000'0000L);
     });
@@ -1048,7 +1385,7 @@ SEASTAR_TEST_CASE(test_rpc_variadic_client_nonvariadic_server) {
         }).get();
         // Client is variadic
         auto f1 = env.proto().make_client<future<rpc::tuple<int, long>> ()>(1);
-        auto result = f1(c1).get0();
+        auto result = f1(c1).get();
         BOOST_REQUIRE_EQUAL(std::get<0>(result), 1);
         BOOST_REQUIRE_EQUAL(std::get<1>(result), 0x7'0000'0000L);
     });
@@ -1056,7 +1393,9 @@ SEASTAR_TEST_CASE(test_rpc_variadic_client_nonvariadic_server) {
 
 SEASTAR_TEST_CASE(test_handler_registration) {
     rpc_test_config cfg;
-    cfg.connect = false;
+    rpc_loopback_error_injector::config ecfg;
+    ecfg.connect_kind = loopback_error_injector::error::abort;
+    cfg.inject_error = ecfg;
     return rpc_test_env<>::do_with_thread(cfg, [] (rpc_test_env<>& env) {
         auto& proto = env.proto();
 
@@ -1166,6 +1505,29 @@ SEASTAR_TEST_CASE(test_unregister_handler) {
             std::cerr << "call failed in an unexpected way: " << std::current_exception() << std::endl;
             BOOST_REQUIRE(false);
         }
+
+        // verify that unregister_handler waits for pending requests to finish
+        {
+            promise<> handler_reached_promise;
+            promise<> handler_go_promise;
+            sstring value_to_return = "before_unregister";
+            env.register_handler(1, [&]() -> future<sstring> {
+                handler_reached_promise.set_value();
+                return handler_go_promise.get_future().then([&] { return value_to_return; });
+            }).get();
+            auto f = env.proto().make_client<future<sstring>()>(1);
+            auto response_future = f(c1);
+            handler_reached_promise.get_future().get();
+            auto unregister_future = env.unregister_handler(1).then([&] {
+                value_to_return = "after_unregister";
+            });
+            BOOST_REQUIRE(!unregister_future.available());
+            sleep(1ms).get();
+            BOOST_REQUIRE(!unregister_future.available());
+            handler_go_promise.set_value();
+            unregister_future.get();
+            BOOST_REQUIRE_EQUAL(response_future.get(), "before_unregister");
+        }
     });
 }
 
@@ -1181,19 +1543,360 @@ SEASTAR_TEST_CASE(test_loggers) {
         proto.set_logger(&log);
         logger(dummy_addr, "Hello2");
         logger(dummy_addr, log_level::debug, "Hello3");
-        // We *want* to test the deprecated API, don't spam warnings about it.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-        proto.set_logger([] (const sstring& str) {
-            log.info("Test: {}", str);
-        });
-#pragma GCC diagnostic pop
-        logger(dummy_addr, "Hello4");
-        logger(dummy_addr, log_level::debug, "Hello5");
         proto.set_logger(nullptr);
         logger(dummy_addr, "Hello6");
         logger(dummy_addr, log_level::debug, "Hello7");
     });
 }
 
+SEASTAR_TEST_CASE(test_connection_id_format) {
+    rpc::connection_id cid = rpc::connection_id::make_id(0x123, 1);
+    std::string res = format("{}", cid);
+    BOOST_REQUIRE_EQUAL(res, "1230001");
+    return make_ready_future<>();
+}
+
 static_assert(std::is_same_v<decltype(rpc::tuple(1U, 1L)), rpc::tuple<unsigned, long>>, "rpc::tuple deduction guid not working");
+
+SEASTAR_TEST_CASE(test_client_info) {
+    return rpc_test_env<>::do_with(rpc_test_config(), [] (rpc_test_env<>& env) {
+        rpc::client_info info{.server{env.server()}, .conn_id{0}};
+        const rpc::client_info& const_info = *const_cast<rpc::client_info*>(&info);
+
+        info.attach_auxiliary("key", 0);
+        BOOST_REQUIRE_EQUAL(const_info.retrieve_auxiliary<int>("key"), 0);
+        info.retrieve_auxiliary<int>("key") = 1;
+        BOOST_REQUIRE_EQUAL(const_info.retrieve_auxiliary<int>("key"), 1);
+
+        BOOST_REQUIRE_EQUAL(info.retrieve_auxiliary_opt<int>("key"), &info.retrieve_auxiliary<int>("key"));
+        BOOST_REQUIRE_EQUAL(const_info.retrieve_auxiliary_opt<int>("key"), &const_info.retrieve_auxiliary<int>("key"));
+
+        BOOST_REQUIRE_EQUAL(info.retrieve_auxiliary_opt<int>("missing"), nullptr);
+        BOOST_REQUIRE_EQUAL(const_info.retrieve_auxiliary_opt<int>("missing"), nullptr);
+
+        return make_ready_future<>();
+    });
+}
+
+void send_messages_and_check_timeouts(rpc_test_env<>& env, test_rpc_proto::client& cln) {
+    env.register_handler(1, [](int v) {
+        return seastar::sleep(std::chrono::seconds(v)).then([v] {
+            return make_ready_future<int>(v);
+        });
+    }).get();
+
+    auto call = env.proto().template make_client<int(int)>(1);
+    auto start = std::chrono::steady_clock::now();
+    auto f1 = call(cln, std::chrono::milliseconds(400), 3).finally([start] {
+        auto end = std::chrono::steady_clock::now();
+        BOOST_REQUIRE(end - start < std::chrono::seconds(1));
+    });
+    auto f2 = call(cln, std::chrono::milliseconds(600), 3).finally([start] {
+        auto end = std::chrono::steady_clock::now();
+        BOOST_REQUIRE(end - start < std::chrono::seconds(1));
+    });
+    BOOST_REQUIRE_THROW(f1.get(), seastar::rpc::timeout_error);
+    BOOST_REQUIRE_THROW(f2.get(), seastar::rpc::timeout_error);
+}
+
+SEASTAR_TEST_CASE(test_rpc_send_timeout) {
+    rpc_test_config cfg;
+    return rpc_test_env<>::do_with_thread(cfg, [] (auto& env, auto& cln) {
+        send_messages_and_check_timeouts(env, cln);
+    });
+}
+
+SEASTAR_TEST_CASE(test_rpc_send_timeout_on_connect) {
+    rpc_test_config cfg;
+    rpc_loopback_error_injector::config ecfg;
+    ecfg.connect_delay = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::seconds(5));
+    cfg.inject_error = ecfg;
+    return rpc_test_env<>::do_with_thread(cfg, [] (auto& env, auto& cln) {
+        send_messages_and_check_timeouts(env, cln);
+    });
+}
+
+SEASTAR_TEST_CASE(test_rpc_abort_connection) {
+    return rpc_test_env<>::do_with_thread(rpc_test_config(), [] (rpc_test_env<>& env) {
+        test_rpc_proto::client c1(env.proto(), {}, env.make_socket(), ipv4_addr());
+        int arrived = 0;
+        env.register_handler(1, [&arrived] (rpc::client_info& cinfo, int x) {
+            BOOST_REQUIRE_EQUAL(x, arrived++);
+            if (arrived == 2) {
+                cinfo.server.abort_connection(cinfo.conn_id);
+            }
+            // The third message won't arrive because we abort the connection.
+
+            return 0;
+        }).get();
+        auto f = env.proto().make_client<int (int)>(1);
+        BOOST_REQUIRE_EQUAL(f(c1, 0).get(), 0);
+        BOOST_REQUIRE_THROW(f(c1, 1).get(), rpc::closed_error);
+        BOOST_REQUIRE_THROW(f(c1, 2).get(), rpc::closed_error);
+        BOOST_REQUIRE_EQUAL(arrived, 2);
+        c1.stop().get();
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_rpc_metric_domains) {
+    auto do_one_echo = [] (rpc_test_env<>& env, test_rpc_proto::client& cln, int nr_calls) {
+        env.register_handler(1, [] (int v) { return make_ready_future<int>(v); }).get();
+        auto call = env.proto().template make_client<int(int)>(1);
+        for (int i = 0; i < nr_calls; i++) {
+            call(cln, i).get();
+        }
+    };
+
+    rpc::client_options client_opt;
+
+    client_opt.metrics_domain = "dom1";
+    auto p1 = rpc_test_env<>::do_with_thread(rpc_test_config(), client_opt, [&] (auto& env, auto& cln) { do_one_echo(env, cln, 3); });
+    client_opt.metrics_domain = "dom2";
+    auto p2 = rpc_test_env<>::do_with_thread(rpc_test_config(), client_opt, [&] (auto& env, auto& cln) { do_one_echo(env, cln, 2); });
+    auto p3 = rpc_test_env<>::do_with_thread(rpc_test_config(), client_opt, [&] (auto& env, auto& cln) { do_one_echo(env, cln, 5); });
+    when_all(std::move(p1), std::move(p2), std::move(p3)).discard_result().get();
+
+    auto get_metrics = [] (std::string name, std::string domain) -> int {
+        const auto& values = seastar::metrics::impl::get_value_map();
+        const auto& mf = values.find(name);
+        BOOST_REQUIRE(mf != values.end());
+        for (auto&& mi : mf->second) {
+            for (auto&&li : mi.first.labels()) {
+                if (li.first == "domain" && li.second == domain) {
+                    return mi.second->get_function()().i();
+                }
+            }
+        }
+        BOOST_FAIL("cannot find requested metrics");
+        return 0;
+    };
+
+    // Negotiation messages also count, so +1 for default domain and +2 for "dom" one
+    BOOST_CHECK_EQUAL(get_metrics("rpc_client_sent_messages", "dom1"), 4);
+    BOOST_CHECK_EQUAL(get_metrics("rpc_client_sent_messages", "dom2"), 9);
+}
+
+// Extract a piece of contiguous data from the front of the buffer (and trim the extracted front away).
+template <typename T>
+requires std::is_trivially_copyable_v<T>
+T read_from_rcv_buf(rpc::rcv_buf& data) {
+    if (data.size < sizeof(T)) {
+        throw std::runtime_error("Truncated compressed RPC frame");
+    }
+    auto it = std::get_if<temporary_buffer<char>>(&data.bufs);
+    if (!it) {
+        it = std::get<std::vector<temporary_buffer<char>>>(data.bufs).data();
+    }
+    std::array<T, 1> out;
+    auto out_span = std::as_writable_bytes(std::span(out)).subspan(0);
+    while (out_span.size()) {
+        size_t n = std::min<size_t>(out_span.size(), it->size());
+        std::memcpy(static_cast<void*>(out_span.data()), it->get(), n);
+        out_span = out_span.subspan(n);
+        it->trim_front(n);
+        ++it;
+        data.size -= n;
+    }
+    return out[0];
+}
+
+
+// Test the use of empty compressed frames as a method of communication between compressors.
+SEASTAR_THREAD_TEST_CASE(test_compressor_empty_frames) {
+    static const sstring compressor_name = "TEST";
+    struct tracker {
+        struct compressor;
+        compressor* _compressor;
+
+        // When `send_metadata(x)` is called, this compressor sends a piece of metadata (x) to its peer,
+        // by prepending it to an empty compressed frame.
+        // It can be read from the peer with `receive_metadata()`.
+        struct compressor : public rpc::compressor {
+            tracker& _tracker;
+
+            std::unique_ptr<rpc::compressor> _delegate;
+
+            using metadata = uint64_t;
+            std::deque<metadata> _send_queue;
+            std::deque<metadata> _recv_queue;
+            semaphore _metadata_received{0};
+
+            std::function<future<>()> _send_empty_frame;
+            condition_variable _needs_progress;
+            future<> _progress_fiber;
+
+            future<> start_progress_fiber() {
+                while (true) {
+                    co_await _needs_progress.when([&] { return !_send_queue.empty(); });
+                    co_await _send_empty_frame();
+                }
+            }
+            future<> close() noexcept override {
+                _needs_progress.broken();
+                return std::move(_progress_fiber).handle_exception([] (const auto&) {});
+            }
+            void send_metadata(metadata x) {
+                _send_queue.push_back(x);
+                _needs_progress.signal();
+            }
+            future<metadata> receive_metadata() {
+                co_await _metadata_received.wait();
+                auto x = _recv_queue.front();
+                _recv_queue.pop_front();
+                co_return x;
+            }
+
+            rpc::snd_buf compress(size_t head_space, rpc::snd_buf data) override {
+                if (!_send_queue.empty()) {
+                    auto x = _delegate->compress(head_space + 1 + sizeof(metadata), data.size ? std::move(data) : rpc::snd_buf(temporary_buffer<char>()));
+                    seastar::write_be<uint8_t>(x.front().get_write()+head_space, 1);
+                    seastar::write_be<uint64_t>(x.front().get_write()+head_space+1, _send_queue.front());
+                    _send_queue.pop_front();
+                    return x;
+                } else {
+                    auto x = _delegate->compress(head_space + 1, data.size ? std::move(data) : rpc::snd_buf(temporary_buffer<char>()));
+                    seastar::write_be<uint8_t>(x.front().get_write()+head_space, 0);
+                    return x;
+                }
+            }
+            rpc::rcv_buf decompress(rpc::rcv_buf data) override {
+                if (net::ntoh(read_from_rcv_buf<uint8_t>(data))) {
+                    _recv_queue.push_back(net::ntoh(read_from_rcv_buf<uint64_t>(data)));
+                    _metadata_received.signal();
+                }
+                return _delegate->decompress(std::move(data));
+            }
+            sstring name() const override {
+                return compressor_name;
+            }
+
+            compressor(tracker& tracker, std::function<future<>()> send_empty_frame)
+                : _tracker(tracker)
+                , _delegate(std::make_unique<rpc::lz4_fragmented_compressor>())
+                , _send_empty_frame(std::move(send_empty_frame))
+                , _progress_fiber(start_progress_fiber())
+            {
+                _tracker._compressor = this;
+            }
+            ~compressor() {
+                _tracker._compressor = nullptr;
+            }
+        };
+
+        struct factory : public rpc::compressor::factory {
+            tracker& _tracker;
+
+            factory(tracker& tracker) : _tracker(tracker) {
+            }
+            const sstring& supported() const override {
+                return compressor_name;
+            }
+            std::unique_ptr<rpc::compressor> negotiate(sstring feature, bool is_server, std::function<future<>()> send_empty_frame) const override {
+                if (feature == supported()) {
+                    return std::make_unique<compressor>(_tracker, std::move(send_empty_frame));
+                }
+                return nullptr;
+            }
+            std::unique_ptr<rpc::compressor> negotiate(sstring feature, bool is_server) const override {
+                abort();
+            }
+        };
+    };
+
+    tracker server_tracker;
+    tracker client_tracker;
+    tracker::factory server_factory{server_tracker};
+    tracker::factory client_factory{client_tracker};
+    rpc::server_options so{.compressor_factory = &server_factory};
+    rpc::client_options co{.compressor_factory = &client_factory};
+    rpc_test_config cfg;
+    cfg.server_options = so;
+
+    rpc_test_env<>::do_with_thread(cfg, co, [&] (rpc_test_env<>& env, test_rpc_proto::client& c) {
+        // Perform an RPC once to initialize the connection and compressors.
+        env.register_handler(1, []() { return 42; }).get();
+        auto proto_client = env.proto().make_client<int()>(1);
+        BOOST_REQUIRE_EQUAL(proto_client(c).get(), 42);
+        BOOST_REQUIRE(client_tracker._compressor);
+        BOOST_REQUIRE(server_tracker._compressor);
+        // Check that both compressors can send metadata to each other.
+        for (int i = 0; i < 3; ++i) {
+            client_tracker._compressor->send_metadata(2*i);
+            BOOST_REQUIRE_EQUAL(server_tracker._compressor->receive_metadata().get(), 2*i);
+            server_tracker._compressor->send_metadata(2*i+1);
+            BOOST_REQUIRE_EQUAL(client_tracker._compressor->receive_metadata().get(), 2*i+1);
+        }
+    }).get();
+}
+
+SEASTAR_TEST_CASE(test_timeout_cancel) {
+    rpc::client_options co;
+    co.send_timeout_data = true;
+    return rpc_test_env<>::do_with_thread(rpc_test_config(), co, [&] (rpc_test_env<>& env, test_rpc_proto::client& cl) {
+        abort_source abort_handler;
+        uint32_t id = 1;
+        int sent = 0;
+        int received = 0;
+        condition_variable cond;
+        env.register_handler(id, [&] (int x) -> future<int> {
+            BOOST_TEST_MESSAGE(format("received value={}", x));
+            received = x;
+            cond.signal();
+            co_await sleep_abortable(std::chrono::seconds(10), abort_handler);
+            co_return x;
+        }).get();
+        auto echo = env.proto().make_client<int (int)>(1);
+        {
+            // Relative timeout
+            auto f = echo(cl, std::chrono::milliseconds(10), ++sent);
+            BOOST_REQUIRE_THROW(f.get(), rpc::timeout_error);
+            while (received != sent) {
+                cond.wait(std::chrono::milliseconds(10)).get();
+            }
+        }
+        {
+            // Absolute timeout
+            auto f = echo(cl, seastar::lowres_clock::now() + std::chrono::milliseconds(10), ++sent);
+            BOOST_REQUIRE_THROW(f.get(), rpc::timeout_error);
+            while (received != sent) {
+                cond.wait(std::chrono::milliseconds(10)).get();
+            }
+        }
+        {
+            // Synchronous cancel before relative timeout
+            rpc::cancellable cancel_rpc;
+            auto f = echo(cl, std::chrono::milliseconds(10), cancel_rpc, ++sent);
+            BOOST_REQUIRE(!f.available());
+            cancel_rpc.cancel();
+            BOOST_REQUIRE_THROW(f.get(), rpc::canceled_error);
+            while (received != sent) {
+                cond.wait(std::chrono::milliseconds(10)).get();
+            }
+        }
+        {
+            // Synchronous cancel before absolute timeout
+            rpc::cancellable cancel_rpc;
+            auto f = echo(cl, seastar::lowres_clock::now() + std::chrono::milliseconds(10), cancel_rpc, ++sent);
+            BOOST_REQUIRE(!f.available());
+            cancel_rpc.cancel();
+            BOOST_REQUIRE_THROW(f.get(), rpc::canceled_error);
+            while (received != sent) {
+                cond.wait(std::chrono::milliseconds(10)).get();
+            }
+        }
+        {
+            // Cancel before timeout while rpc is in flight
+            rpc::cancellable cancel_rpc;
+            auto f = echo(cl, seastar::lowres_clock::now() + std::chrono::milliseconds(10), cancel_rpc, +sent);
+            BOOST_REQUIRE(!f.available());
+            // Wait until the rpc is received, then cancel
+            while (received != sent) {
+                cond.wait(std::chrono::milliseconds(10)).get();
+            }
+            cancel_rpc.cancel();
+            BOOST_REQUIRE_THROW(f.get(), rpc::canceled_error);
+        }
+        abort_handler.request_abort();
+        env.unregister_handler(id).get();
+    });
+}

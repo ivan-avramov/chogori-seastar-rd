@@ -21,6 +21,7 @@
 
 #include <seastar/core/print.hh>
 #include <seastar/net/ethernet.hh>
+#include <fmt/ostream.h>
 #include <boost/algorithm/string.hpp>
 #include <string>
 
@@ -31,8 +32,9 @@ namespace net {
 std::ostream& operator<<(std::ostream& os, ethernet_address ea) {
     auto& m = ea.mac;
     using u = uint32_t;
-    return fmt_print(os, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+    fmt::print(os, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             u(m[0]), u(m[1]), u(m[2]), u(m[3]), u(m[4]), u(m[5]));
+    return os;
 }
 
 ethernet_address parse_ethernet_address(std::string addr)

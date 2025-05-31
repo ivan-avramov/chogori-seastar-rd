@@ -19,10 +19,36 @@
  * Copyright 2015 Cloudius Systems
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <any>
+#include <filesystem>
+#include <stdexcept>
+#include <system_error>
+#include <memory>
+#include <chrono>
+#include <span>
+#include <unordered_set>
+
+#include <seastar/util/assert.hh>
+
+#include <netinet/in.h>
+#include <sys/stat.h>
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
-#include <system_error>
 
+#include <boost/any.hpp>
+#include <boost/range/iterator_range.hpp>
+#include <boost/range/adaptor/map.hpp>
+
+#include <fmt/core.h>
+#include <fmt/ostream.h>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/core/loop.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
@@ -37,11 +63,8 @@
 #include <seastar/net/stack.hh>
 #include <seastar/util/std-compat.hh>
 #include <seastar/util/variant_utils.hh>
-
-#include <boost/range/iterator_range.hpp>
-#include <boost/range/adaptor/map.hpp>
-
-#include "../core/fsnotify.hh"
+#include <seastar/core/fsnotify.hh>
+#endif
 
 namespace seastar {
 
@@ -49,6 +72,13 @@ class net::get_impl {
 public:
     static std::unique_ptr<connected_socket_impl> get(connected_socket s) {
         return std::move(s._csi);
+    }
+
+    static connected_socket_impl* maybe_get_ptr(connected_socket& s) {
+        if (s._csi) {
+            return s._csi.get();
+        }
+        return nullptr;
     }
 };
 
@@ -102,7 +132,7 @@ static future<file_result> read_fully(const sstring& name, const sstring& what) 
         return do_with(std::move(f), [name = std::move(name)](file& f) mutable {
             return f.stat().then([&f, name = std::move(name)](struct stat s) mutable {
                 return f.dma_read_bulk<char>(0, s.st_size).then([s, name = std::move(name)](temporary_buffer<char> buf) mutable {
-                    return file_result{ std::move(buf), file_info{ 
+                    return file_result{ std::move(buf), file_info{
                         std::move(name), std::chrono::system_clock::from_time_t(s.st_mtim.tv_sec) +
                             std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::nanoseconds(s.st_mtim.tv_nsec))
                     } };
@@ -127,21 +157,24 @@ static future<file_result> read_fully(const sstring& name, const sstring& what) 
 class gnutls_error_category : public std::error_category {
 public:
     constexpr gnutls_error_category() noexcept : std::error_category{} {}
-    const char * name() const noexcept {
+    const char * name() const noexcept override {
         return "GnuTLS";
     }
-    std::string message(int error) const {
+    std::string message(int error) const override {
         return gnutls_strerror(error);
     }
 };
 
-static const gnutls_error_category glts_errorc;
+const std::error_category& tls::error_category() {
+    static const gnutls_error_category ec;
+    return ec;
+}
 
 // Checks a gnutls return value.
 // < 0 -> error.
 static void gtls_chk(int res) {
     if (res < 0) {
-        throw std::system_error(res, glts_errorc);
+        throw std::system_error(res, tls::error_category());
     }
 }
 
@@ -162,7 +195,7 @@ static auto get_gtls_string = [](auto func, auto... args) noexcept {
     if (ret != GNUTLS_E_SHORT_MEMORY_BUFFER) {
         return std::make_pair(ret, sstring{});
     }
-    assert(size != 0);
+    SEASTAR_ASSERT(size != 0);
     sstring res(sstring::initialized_later{}, size - 1);
     ret = func(args..., res.data(), &size);
     return std::make_pair(ret, res);
@@ -193,14 +226,14 @@ class tls::dh_params::impl : gnutlsobj {
         return dh_ptr(params, &gnutls_dh_params_deinit);
     }
 public:
-    impl(dh_ptr p) 
-        : _params(std::move(p)) 
+    impl(dh_ptr p)
+        : _params(std::move(p))
     {}
     impl(level lvl)
 #if GNUTLS_VERSION_NUMBER >= 0x030506
         : _params(nullptr, &gnutls_dh_params_deinit)
         , _sec_param(to_gnutls_level(lvl))
-#else        
+#else
         : impl([&] {
             auto bits = gnutls_sec_param_to_pk_bits(GNUTLS_PK_DH, to_gnutls_level(lvl));
             auto ptr = new_dh_params();
@@ -215,14 +248,14 @@ public:
             blob_wrapper w(pkcs3);
             gtls_chk(gnutls_dh_params_import_pkcs3(ptr.get(), &w, gnutls_x509_crt_fmt_t(fmt)));
             return ptr;
-        }()) 
+        }())
     {}
     impl(const impl& v)
         : impl([&v] {
             auto ptr = new_dh_params();
             gtls_chk(gnutls_dh_params_cpy(ptr.get(), v));
             return ptr;
-        }()) 
+        }())
     {}
     ~impl() = default;
 
@@ -304,6 +337,40 @@ future<tls::x509_cert> tls::x509_cert::from_file(
     });
 }
 
+// wrapper for gnutls_datum, with raii free
+struct gnutls_datum : public gnutls_datum_t {
+    gnutls_datum(size_t s) {
+        data = reinterpret_cast<unsigned char*>(gnutls_malloc(s));
+        if (data == nullptr) {
+           throw std::bad_alloc();
+        }
+        size = s;
+    }
+    gnutls_datum() {
+        data = nullptr;
+        size = 0;
+    }
+    gnutls_datum(const gnutls_datum&) = delete;
+    gnutls_datum& operator=(gnutls_datum&& other) {
+        if (this == &other) {
+            return *this;
+        }
+        if (data != nullptr) {
+            ::gnutls_memset(data, 0, size);
+            ::gnutls_free(data);
+        }
+        data = std::exchange(other.data, nullptr);
+        size = std::exchange(other.size, 0);
+        return *this;
+    }
+    ~gnutls_datum() {
+        if (data != nullptr) {
+            ::gnutls_memset(data, 0, size);
+            ::gnutls_free(data);
+        }
+    }
+};
+
 class tls::certificate_credentials::impl: public gnutlsobj {
 public:
     impl()
@@ -376,6 +443,25 @@ public:
     client_auth get_client_auth() const {
         return _client_auth;
     }
+    void set_session_resume_mode(session_resume_mode m, std::span<const uint8_t> key = {}) {
+        _session_resume_mode = m;
+        // (re-)generate session key
+        if (m != session_resume_mode::NONE) {
+            _session_resume_key = {};
+            if (key.empty()) {
+                gtls_chk(gnutls_session_ticket_key_generate(&_session_resume_key));
+            } else {
+                _session_resume_key = gnutls_datum(key.size());
+                std::copy(key.begin(), key.end(), _session_resume_key.data);
+            }
+        }
+    }
+    session_resume_mode get_session_resume_mode() const {
+        return _session_resume_mode;
+    }
+    const gnutls_datum_t* get_session_resume_key() const {
+        return &_session_resume_key;
+    }
     void set_priority_string(const sstring& prio) {
         const char * err = prio.c_str();
         try {
@@ -393,6 +479,11 @@ public:
     void set_dn_verification_callback(dn_callback cb) {
         _dn_callback = std::move(cb);
     }
+
+    void set_enable_certificate_verification(bool enable) {
+        _enable_certificate_verification = enable;
+    }
+
 private:
     friend class credentials_builder;
     friend class session;
@@ -413,9 +504,12 @@ private:
     std::unique_ptr<tls::dh_params::impl> _dh_params;
     std::unique_ptr<std::remove_pointer_t<gnutls_priority_t>, void(*)(gnutls_priority_t)> _priority;
     client_auth _client_auth = client_auth::NONE;
+    session_resume_mode _session_resume_mode = session_resume_mode::NONE;
     bool _load_system_trust = false;
     semaphore _system_trust_sem {1};
     dn_callback _dn_callback;
+    bool _enable_certificate_verification = true;
+    gnutls_datum _session_resume_key;
 };
 
 tls::certificate_credentials::certificate_credentials()
@@ -493,6 +587,10 @@ void tls::certificate_credentials::set_dn_verification_callback(dn_callback cb) 
     _impl->set_dn_verification_callback(std::move(cb));
 }
 
+void tls::certificate_credentials::set_enable_certificate_verification(bool enable) {
+    _impl->set_enable_certificate_verification(enable);
+}
+
 tls::server_credentials::server_credentials()
 #if GNUTLS_VERSION_NUMBER < 0x030600
     : server_credentials(dh_params{})
@@ -514,6 +612,11 @@ tls::server_credentials& tls::server_credentials::operator=(
 void tls::server_credentials::set_client_auth(client_auth ca) {
     _impl->set_client_auth(ca);
 }
+
+void tls::server_credentials::set_session_resume_mode(session_resume_mode m) {
+    _impl->set_session_resume_mode(m);
+}
+
 
 static const sstring dh_level_key = "dh_level";
 static const sstring x509_trust_key = "x509_trust";
@@ -617,12 +720,21 @@ void tls::credentials_builder::set_priority_string(const sstring& prio) {
     _priority = prio;
 }
 
+void tls::credentials_builder::set_session_resume_mode(session_resume_mode m) {
+    _session_resume_mode = m;
+    if (m != session_resume_mode::NONE) {
+        gnutls_datum key;
+        gtls_chk(gnutls_session_ticket_key_generate(&key));
+        _session_resume_key.assign(key.data, key.data + key.size);
+    }
+}
+
 template<typename Blobs, typename Visitor>
 static void visit_blobs(Blobs& blobs, Visitor&& visitor) {
     auto visit = [&](const sstring& key, auto* vt) {
         auto tr = blobs.equal_range(key);
         for (auto& p : boost::make_iterator_range(tr.first, tr.second)) {
-            auto* v = boost::any_cast<std::decay_t<decltype(*vt)>>(&p.second);
+            auto* v = std::any_cast<std::decay_t<decltype(*vt)>>(&p.second);
             visitor(key, *v);
         }
     };
@@ -664,6 +776,8 @@ void tls::credentials_builder::apply_to(certificate_credentials& creds) const {
     }
 
     creds._impl->set_client_auth(_client_auth);
+    // Note: this causes server session key rotation on cert reload
+    creds._impl->set_session_resume_mode(_session_resume_mode, std::span{_session_resume_key.begin(), _session_resume_key.end()});
 }
 
 shared_ptr<tls::certificate_credentials> tls::credentials_builder::build_certificate_credentials() const {
@@ -683,7 +797,7 @@ shared_ptr<tls::server_credentials> tls::credentials_builder::build_server_crede
         return creds;
 #endif
     }
-    auto creds = make_shared<server_credentials>(dh_params(boost::any_cast<dh_params::level>(i->second)));
+    auto creds = make_shared<server_credentials>(dh_params(std::any_cast<dh_params::level>(i->second)));
     apply_to(*creds);
     return creds;
 }
@@ -702,7 +816,7 @@ public:
     public:
         using time_point = std::chrono::system_clock::time_point;
 
-        reloading_builder(credentials_builder b, reload_callback cb, reloadable_credentials_base* creds, delay_type delay)
+        reloading_builder(credentials_builder b, reload_callback_ex cb, reloadable_credentials_base* creds, delay_type delay)
             : credentials_builder(std::move(b))
             , _cb(std::move(cb))
             , _creds(creds)
@@ -736,7 +850,7 @@ public:
         void run() {
             while (_creds) {
                 try {
-                    auto events = _fsn.wait().get0();
+                    auto events = _fsn.wait().get();
                     if (events.empty() && _creds == nullptr) {
                         return;
                     }
@@ -759,6 +873,8 @@ public:
             _timer.cancel();
         }
     private:
+        using fsnotifier = experimental::fsnotifier;
+
         // called from seastar::thread
         void rebuild(const std::vector<fsnotifier::event>& events) {
             for (auto& e : events) {
@@ -768,9 +884,9 @@ public:
                 auto i = _watches.find(e.id);
                 if (i != _watches.end()) {
                     auto& filename = i->second.second;
-                    // only add actual file watches to 
+                    // only add actual file watches to
                     // query set. If this was a directory
-                    // watch, the file should already be 
+                    // watch, the file should already be
                     // in there.
                     if (_all_files.count(filename)) {
                         _files[filename] = e.mask;
@@ -804,7 +920,7 @@ public:
                     // just ignore for now, and hope the dir watch will tell us when it is back...
                     return;
                 }
-                temporary_buffer<char> buf = read_fully(filename, "reloading").get0();
+                temporary_buffer<char> buf = read_fully(filename, "reloading").get();
                 dst = to_buffer(buf);
                 ++num_changed;
             };
@@ -826,13 +942,17 @@ public:
                 return;
             }
             try {
+                // force rebuilding session resume mode key if
+                // enabled. should not reuse sessions across certificate
+                // change (should not work anyway)
+                set_session_resume_mode(_session_resume_mode);
                 if (_creds) {
                     _creds->rebuild(*this);
                 }
             } catch (...) {
                 if (std::any_of(_files.begin(), _files.end(), [](auto& p) { return p.second == fsnotifier::flags::ignored; })) {
                     // if any file in the reload set was deleted - i.e. we have not seen a "closed" yet - assume
-                    // this is a spurious reload and we'd better wait for next event - hopefully a "closed" - 
+                    // this is a spurious reload and we'd better wait for next event - hopefully a "closed" -
                     // and try again
                     return;
                 }
@@ -845,7 +965,7 @@ public:
         }
         void on_success() {
             _files.clear();
-            // remove all directory watches, since we've successfully 
+            // remove all directory watches, since we've successfully
             // reloaded -> the file watches themselves should suffice now
             auto i = _watches.begin();
             auto e = _watches.end();
@@ -859,7 +979,7 @@ public:
         }
         void do_callback(std::exception_ptr ep = {}) {
             if (_cb && !_files.empty()) {
-                _cb(boost::copy_range<std::unordered_set<sstring>>(_files | boost::adaptors::map_keys), std::move(ep));
+                _cb(*this, boost::copy_range<std::unordered_set<sstring>>(_files | boost::adaptors::map_keys), std::move(ep)).get();
             }
         }
         // called from seastar::thread
@@ -867,20 +987,21 @@ public:
             auto dir = std::filesystem::path(filename).parent_path();
             for (;;) {
                 try {
-                    return add_watch(dir.native(), fsnotifier::flags::create_child | fsnotifier::flags::move).get0();
+                    return add_watch(dir.native(), fsnotifier::flags::create_child | fsnotifier::flags::move).get();
                 } catch (...) {
-                    if (!dir.has_parent_path()) {
+                    auto parent = dir.parent_path();
+                    if (parent.empty() || dir == parent) {
                         throw;
                     }
-                    dir = dir.parent_path();
+                    dir = std::move(parent);
                     continue;
                 }
             }
         }
-        future<fsnotifier::watch_token> add_watch(const sstring& filename, fsnotifier::flags flags = fsnotifier::flags::close) {
+        future<fsnotifier::watch_token> add_watch(const sstring& filename, fsnotifier::flags flags = fsnotifier::flags::close_write|fsnotifier::flags::delete_self) {
             return _fsn.create_watch(filename, flags).then([this, filename = filename](fsnotifier::watch w) {
                 auto t = w.token();
-                // we might create multiple watches for same token in case of dirs, avoid deleting previously 
+                // we might create multiple watches for same token in case of dirs, avoid deleting previously
                 // created one
                 if (_watches.count(t)) {
                     w.release();
@@ -891,7 +1012,7 @@ public:
             });
         }
 
-        reload_callback _cb;
+        reload_callback_ex _cb;
         reloadable_credentials_base* _creds;
         fsnotifier _fsn;
         std::unordered_map<fsnotifier::watch_token, std::pair<fsnotifier::watch, sstring>> _watches;
@@ -900,7 +1021,7 @@ public:
         timer<> _timer;
         delay_type _delay;
     };
-    reloadable_credentials_base(credentials_builder builder, reload_callback cb, delay_type delay = default_tolerance)
+    reloadable_credentials_base(credentials_builder builder, reload_callback_ex cb, delay_type delay = default_tolerance)
         : _builder(seastar::make_shared<reloading_builder>(std::move(builder), std::move(cb), this, delay))
     {
         _builder->start();
@@ -919,7 +1040,7 @@ private:
 template<typename Base>
 class tls::reloadable_credentials : public Base, public tls::reloadable_credentials_base {
 public:
-    reloadable_credentials(credentials_builder builder, reload_callback cb, Base b, delay_type delay = default_tolerance)
+    reloadable_credentials(credentials_builder builder, reload_callback_ex cb, Base b, delay_type delay = default_tolerance)
         : Base(std::move(b))
         , tls::reloadable_credentials_base(std::move(builder), std::move(cb), delay)
     {}
@@ -928,28 +1049,50 @@ public:
 
 template<>
 void tls::reloadable_credentials<tls::certificate_credentials>::rebuild(const credentials_builder& builder) {
-    auto tmp = builder.build_certificate_credentials();
-    this->_impl = std::move(tmp->_impl);
+    builder.rebuild(*this);
 }
 
 template<>
 void tls::reloadable_credentials<tls::server_credentials>::rebuild(const credentials_builder& builder) {
-    auto tmp = builder.build_server_credentials();
-    this->_impl = std::move(tmp->_impl);
+    builder.rebuild(*this);
 }
 
-future<shared_ptr<tls::certificate_credentials>> tls::credentials_builder::build_reloadable_certificate_credentials(reload_callback cb, std::optional<std::chrono::milliseconds> tolerance) const {
+void tls::credentials_builder::rebuild(certificate_credentials& creds) const {
+    auto tmp = build_certificate_credentials();
+    creds._impl = std::move(tmp->_impl);
+}
+
+void tls::credentials_builder::rebuild(server_credentials& creds) const {
+    auto tmp = build_server_credentials();
+    creds._impl = std::move(tmp->_impl);
+}
+
+future<shared_ptr<tls::certificate_credentials>> tls::credentials_builder::build_reloadable_certificate_credentials(reload_callback_ex cb, std::optional<std::chrono::milliseconds> tolerance) const {
     auto creds = seastar::make_shared<reloadable_credentials<tls::certificate_credentials>>(*this, std::move(cb), std::move(*build_certificate_credentials()), tolerance.value_or(reloadable_credentials_base::default_tolerance));
     return creds->init().then([creds] {
         return make_ready_future<shared_ptr<tls::certificate_credentials>>(creds);
     });
 }
 
-future<shared_ptr<tls::server_credentials>> tls::credentials_builder::build_reloadable_server_credentials(reload_callback cb, std::optional<std::chrono::milliseconds> tolerance) const {
+future<shared_ptr<tls::server_credentials>> tls::credentials_builder::build_reloadable_server_credentials(reload_callback_ex cb, std::optional<std::chrono::milliseconds> tolerance) const {
     auto creds = seastar::make_shared<reloadable_credentials<tls::server_credentials>>(*this, std::move(cb), std::move(*build_server_credentials()), tolerance.value_or(reloadable_credentials_base::default_tolerance));
     return creds->init().then([creds] {
         return make_ready_future<shared_ptr<tls::server_credentials>>(creds);
     });
+}
+
+future<shared_ptr<tls::certificate_credentials>> tls::credentials_builder::build_reloadable_certificate_credentials(reload_callback cb, std::optional<std::chrono::milliseconds> tolerance) const {
+    return build_reloadable_certificate_credentials([cb = std::move(cb)](const credentials_builder&, const std::unordered_set<sstring>& files, std::exception_ptr p) {
+        cb(files, p);
+        return make_ready_future<>();
+    }, tolerance);
+}
+
+future<shared_ptr<tls::server_credentials>> tls::credentials_builder::build_reloadable_server_credentials(reload_callback cb, std::optional<std::chrono::milliseconds> tolerance) const {
+    return build_reloadable_server_credentials([cb = std::move(cb)](const credentials_builder&, const std::unordered_set<sstring>& files, std::exception_ptr p) {
+        cb(files, p);
+        return make_ready_future<>();
+    }, tolerance);
 }
 
 namespace tls {
@@ -971,10 +1114,10 @@ public:
     };
 
     session(type t, shared_ptr<tls::certificate_credentials> creds,
-            std::unique_ptr<net::connected_socket_impl> sock, sstring name = { })
-            : _type(t), _sock(std::move(sock)), _creds(creds->_impl), _hostname(
-                    std::move(name)), _in(_sock->source()), _out(_sock->sink()),
-                    _in_sem(1), _out_sem(1), _output_pending(
+            std::unique_ptr<net::connected_socket_impl> sock, tls_options options = {})
+            : _type(t), _sock(std::move(sock)), _creds(creds->_impl),
+                    _in(_sock->source()), _out(_sock->sink()),
+                    _in_sem(1), _out_sem(1), _options(std::move(options)), _output_pending(
                     make_ready_future<>()), _session([t] {
                 gnutls_session_t session;
                 gtls_chk(gnutls_init(&session, GNUTLS_NONBLOCK|uint32_t(t)));
@@ -997,6 +1140,15 @@ public:
                     gnutls_certificate_server_set_request(*this, GNUTLS_CERT_REQUIRE);
                     break;
             }
+            // Maybe set up server session ticket support
+            switch (_creds->get_session_resume_mode()) {
+                case session_resume_mode::NONE:
+                default:
+                    break;
+                case session_resume_mode::TLS13_SESSION_TICKET:
+                    gnutls_session_ticket_enable_server(*this, _creds->get_session_resume_key());
+                    break;
+            }
         }
 
         auto prio = _creds->get_priority();
@@ -1015,15 +1167,21 @@ public:
             gnutls_session_set_verify_function(*this, &verify_wrapper);
         }
 #endif
+        // if we are a client, check if we have a session ticket to unpack.
+        if (_type == type::CLIENT && !_options.session_resume_data.empty()) {
+            gtls_chk(gnutls_session_set_data(*this, _options.session_resume_data.data(), _options.session_resume_data.size()));
+        }
+        _options.session_resume_data.clear(); // no need to keep around
     }
     session(type t, shared_ptr<certificate_credentials> creds,
-            connected_socket sock, sstring name = { })
+            connected_socket sock,
+            tls_options options = {})
             : session(t, std::move(creds), net::get_impl::get(std::move(sock)),
-                    std::move(name)) {
+                      std::move(options)) {
     }
 
     ~session() {
-        assert(_output_pending.available());
+        SEASTAR_ASSERT(_output_pending.available());
     }
 
     typedef temporary_buffer<char> buf_type;
@@ -1037,12 +1195,34 @@ public:
         gnutls_free(out.data);
         return s;
     }
+
+    future<> send_alert(gnutls_alert_level_t level, gnutls_alert_description_t desc) {
+        return repeat([this, level, desc]() {
+            auto res = gnutls_alert_send(*this, level, desc);
+            switch(res) {
+            case GNUTLS_E_SUCCESS:
+                return wait_for_output().then([] {
+                    return make_ready_future<stop_iteration>(stop_iteration::yes);
+                });
+            case GNUTLS_E_AGAIN:
+            case GNUTLS_E_INTERRUPTED:
+                return wait_for_output().then([] {
+                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                });
+            default:
+                return handle_output_error(res).then([] {
+                    return make_ready_future<stop_iteration>(stop_iteration::yes);
+                });
+            }
+        });
+    }
+
     future<> do_handshake() {
         if (_connected) {
             return make_ready_future<>();
         }
-        if (_type == type::CLIENT && !_hostname.empty()) {
-            gnutls_server_name_set(*this, GNUTLS_NAME_DNS, _hostname.data(), _hostname.size());
+        if (_type == type::CLIENT && !_options.server_name.empty()) {
+            gnutls_server_name_set(*this, GNUTLS_NAME_DNS, _options.server_name.data(), _options.server_name.size());
         }
         try {
             auto res = gnutls_handshake(*this);
@@ -1069,9 +1249,22 @@ public:
 #if GNUTLS_VERSION_NUMBER >= 0x030406
                 case GNUTLS_E_CERTIFICATE_ERROR:
                     verify(); // should throw. otherwise, fallthrough
+                    [[fallthrough]];
 #endif
                 default:
-                    return make_exception_future<>(std::system_error(res, glts_errorc));
+                    // Send the handshake error returned by gnutls_handshake()
+                    // to the client, as an alert. For example, if the protocol
+                    // version requested by the client is not supported, the
+                    // "protocol_version" alert is sent.
+                    auto alert = gnutls_alert_description_t(gnutls_error_to_alert(res, NULL));
+                    return handle_output_error(res).then_wrapped([this, alert = std::move(alert)] (future<> output_future) {
+                        return send_alert(GNUTLS_AL_FATAL, alert).then_wrapped([output_future = std::move(output_future)] (future<> f) mutable {
+                            // Return to the caller the original handshake error.
+                            // If send_alert() *also* failed, ignore that.
+                            f.ignore_ready_future();
+                            return std::move(output_future);
+                        });
+                    });
                 }
             }
             if (_type == type::CLIENT || _creds->get_client_auth() != client_auth::NONE) {
@@ -1095,7 +1288,12 @@ public:
         // acquire both semaphores to sync both read & write
         return with_semaphore(_in_sem, 1, [this] {
             return with_semaphore(_out_sem, 1, [this] {
-                return do_handshake();
+                return do_handshake().handle_exception([this](auto ep) {
+                    if (!_error) {
+                        _error = ep;
+                    }
+                    return make_exception_future<>(_error);
+                });
             });
         });
     }
@@ -1114,13 +1312,13 @@ public:
             _eof |= buf.empty();
            _input = std::move(buf);
         }).handle_exception([this](auto ep) {
-           _error = true;
+           _error = ep;
            return make_exception_future(ep);
         });
     }
     future<> wait_for_output() {
         return std::exchange(_output_pending, make_ready_future()).handle_exception([this](auto ep) {
-           _error = true;
+           _error = ep;
            return make_exception_future(ep);
         });
     }
@@ -1146,41 +1344,41 @@ public:
     }
 
     void verify() {
+        if (!_creds->_enable_certificate_verification) {
+            return;
+        }
+
         unsigned int status;
-        auto res = gnutls_certificate_verify_peers3(*this, _type != type::CLIENT || _hostname.empty()
-                        ? nullptr : _hostname.c_str(), &status);
+        auto res = gnutls_certificate_verify_peers3(*this, _type != type::CLIENT || _options.server_name.empty()
+                        ? nullptr : _options.server_name.c_str(), &status);
         if (res == GNUTLS_E_NO_CERTIFICATE_FOUND && _type != type::CLIENT && _creds->get_client_auth() != client_auth::REQUIRE) {
             return;
         }
         if (res < 0) {
-            throw std::system_error(res, glts_errorc);
+            throw std::system_error(res, error_category());
         }
         if (status & GNUTLS_CERT_INVALID) {
-            throw verification_error(
-                    cert_status_to_string(gnutls_certificate_type_get(*this),
-                            status));
+            auto stat_str = cert_status_to_string(gnutls_certificate_type_get(*this), status);
+            auto dn = extract_dn_information();
+
+            // If possible, include issuer/subject info on the cert that failed verification.
+            if (dn) {
+                std::stringstream ss;
+                ss << stat_str;
+                if (stat_str.back() != ' ') {
+                    ss << ' ';
+                }
+                ss << "(Issuer=[" << dn->issuer << "], Subject=[" << dn->subject << "])";
+                stat_str = ss.str();
+            }
+            throw verification_error(stat_str);
         }
         if (_creds->_dn_callback) {
             // if the user registered a DN (Distinguished Name) callback
             // then extract subject and issuer from the (leaf) peer certificate and invoke the callback
 
-            unsigned int list_size;
-            const gnutls_datum_t* client_cert_list = gnutls_certificate_get_peers(*this, &list_size);
-            assert(list_size > 0); // otherwise we couldn't have gotten here
-
-            gnutls_x509_crt_t peer_leaf_cert;
-            gtls_chk(gnutls_x509_crt_init(&peer_leaf_cert));
-            gtls_chk(gnutls_x509_crt_import(peer_leaf_cert, &(client_cert_list[0]), GNUTLS_X509_FMT_DER));
-
-            // we need get_string to be noexcept because we need to manually de-init peer_leaf_cert afterwards
-            auto [ec, subject] = get_gtls_string(gnutls_x509_crt_get_dn, peer_leaf_cert);
-            auto [ec2, issuer] = get_gtls_string(gnutls_x509_crt_get_issuer_dn, peer_leaf_cert);
-
-            gnutls_x509_crt_deinit(peer_leaf_cert);
-
-            if (ec || ec2) {
-                throw std::runtime_error("error while extracting certificate DN strings");
-            }
+            auto dn = extract_dn_information();
+            SEASTAR_ASSERT(dn.has_value()); // otherwise we couldn't have gotten here
 
             // a switch here might look overelaborate, however,
             // the compiler will warn us if someone alters the definition of type
@@ -1194,13 +1392,13 @@ public:
                 break;
             }
 
-            _creds->_dn_callback(t, std::move(subject), std::move(issuer));
+            _creds->_dn_callback(t, std::move(dn->subject), std::move(dn->issuer));
         }
     }
 
     future<temporary_buffer<char>> get() {
         if (_error) {
-            return make_exception_future<temporary_buffer<char>>(std::system_error(EINVAL, std::system_category()));
+            return make_exception_future<temporary_buffer<char>>(_error);
         }
         if (_shutdown || eof()) {
             return make_ready_future<temporary_buffer<char>>();
@@ -1247,8 +1445,8 @@ public:
                     _connected = false;
                     return make_ready_future<temporary_buffer<char>>();
                 default:
-                    _error = true;
-                    return make_exception_future<temporary_buffer<char>>(std::system_error(n, glts_errorc));
+                    _error = std::make_exception_ptr(std::system_error(n, error_category()));
+                    return make_exception_future<temporary_buffer<char>>(_error);
                 }
             }
             buf.trim(n);
@@ -1269,7 +1467,7 @@ public:
     typedef net::fragment* frag_iter;
 
     future<> do_put(frag_iter i, frag_iter e) {
-        assert(_output_pending.available());
+        SEASTAR_ASSERT(_output_pending.available());
         return do_for_each(i, e, [this](net::fragment& f) {
             auto ptr = f.base;
             auto size = f.size;
@@ -1291,14 +1489,29 @@ public:
         });
     }
     future<> put(net::packet p) {
-        if (_error || _shutdown) {
-            return make_exception_future<>(std::system_error(EINVAL, std::system_category()));
+        if (_error) {
+            return make_exception_future<>(_error);
+        }
+        if (_shutdown) {
+            return make_exception_future<>(std::system_error(EPIPE, std::system_category()));
         }
         if (!_connected) {
             return handshake().then([this, p = std::move(p)]() mutable {
                return put(std::move(p));
             });
         }
+
+        // We want to make sure that we call gnutls_record_send with as large
+        // packets as possible. This is because each call to gnutls_record_send
+        // translates to a sendmsg syscall. Further it results in larger TLS
+        // records which makes encryption/decryption faster. Hence to avoid
+        // cases where we would do an extra syscall for something like a 100
+        // bytes header we linearize the packet if it's below the max TLS record
+        // size.
+        if (p.nr_frags() > 1 && p.len() <= gnutls_record_get_max_size(*this)) {
+            p.linearize();
+        }
+
         auto i = p.fragments().begin();
         auto e = p.fragments().end();
         return with_semaphore(_out_sem, 1, std::bind(&session::do_put, this, i, e)).finally([p = std::move(p)] {});
@@ -1325,13 +1538,25 @@ public:
             return -1;
         }
         try {
-            scattered_message<char> msg;
-            for (int i = 0; i < iovcnt; ++i) {
-                msg.append(std::string_view(reinterpret_cast<const char *>(iov[i].iov_base), iov[i].iov_len));
+            ssize_t n; // Set on the good path and unused on the bad path
+
+            if (!_output_pending.failed()) {
+                scattered_message<char> msg;
+                for (int i = 0; i < iovcnt; ++i) {
+                    msg.append(std::string_view(reinterpret_cast<const char *>(iov[i].iov_base), iov[i].iov_len));
+                }
+                n = msg.size();
+                _output_pending = _out.put(std::move(msg).release());
             }
-            auto n = msg.size();
-            _output_pending = _out.put(std::move(msg).release());
+            if (_output_pending.failed()) {
+                // exception is copied back into _output_pending
+                // by the catch handlers below
+                std::rethrow_exception(_output_pending.get_exception());
+            }
             return n;
+        } catch (const std::system_error& e) {
+            gnutls_transport_set_errno(*this, e.code().value());
+            _output_pending = make_exception_future<>(std::current_exception());
         } catch (...) {
             gnutls_transport_set_errno(*this, EIO);
             _output_pending = make_exception_future<>(std::current_exception());
@@ -1345,12 +1570,12 @@ public:
 
     future<>
     handle_error(int res) {
-        _error = true;
-        return make_exception_future(std::system_error(res, glts_errorc));
+        _error = std::make_exception_ptr(std::system_error(res, error_category()));
+        return make_exception_future(_error);
     }
     future<>
     handle_output_error(int res) {
-        _error = true;
+        _error = std::make_exception_ptr(std::system_error(res, error_category()));
         // #453
         // defensively wait for output before generating the error.
         // if we have both error code and an exception in output
@@ -1359,9 +1584,9 @@ public:
             try {
                 f.get();
                 // output was ok/done, just generate error code exception
-                return handle_error(res);
+                return make_exception_future(_error);
             } catch (...) {
-                std::throw_with_nested(std::system_error(res, glts_errorc));
+                std::throw_with_nested(std::system_error(res, error_category()));
             }
         });
     }
@@ -1375,7 +1600,7 @@ public:
             case GNUTLS_E_AGAIN:
                 // We only send "bye" alert, letting a "normal" (either pending, or subsequent)
                 // read deal with reading the expected EOF alert.
-                assert(gnutls_record_get_direction(*this) == 1);
+                SEASTAR_ASSERT(gnutls_record_get_direction(*this) == 1);
                 return wait_for_output().then([this] {
                     return do_shutdown();
                 });
@@ -1386,6 +1611,10 @@ public:
         return wait_for_output();
     }
     future<> wait_for_eof() {
+        if (!_options.wait_for_eof_on_shutdown) {
+            return make_ready_future();
+        }
+
         // read records until we get an eof alert
         // since this call could time out, we must not ac
         return with_semaphore(_in_sem, 1, [this] {
@@ -1415,16 +1644,16 @@ public:
                         std::bind(&session::do_shutdown, this)).then(
                         std::bind(&session::wait_for_eof, this)).finally([me = shared_from_this()] {});
         // note moved finally clause above. It is theorethically possible
-        // that we could complete do_shutdown just before the close calls 
-        // below, get pre-empted, have "close()" finish, get freed, and 
+        // that we could complete do_shutdown just before the close calls
+        // below, get pre-empted, have "close()" finish, get freed, and
         // then call wait_for_eof on stale pointer.
     }
-    void close() {
+    void close() noexcept {
         // only do once.
         if (!std::exchange(_shutdown, true)) {
             auto me = shared_from_this();
             // running in background. try to bye-handshake us nicely, but after 10s we forcefully close.
-            (void)with_timeout(timer<>::clock::now() + std::chrono::seconds(10), shutdown()).finally([this] {
+            engine().run_in_background(with_timeout(timer<>::clock::now() + std::chrono::seconds(10), shutdown()).finally([this] {
                 _eof = true;
                 try {
                     (void)_in.close().handle_exception([](std::exception_ptr) {}); // should wake any waiters
@@ -1442,7 +1671,7 @@ public:
                 });
             }).then_wrapped([me = std::move(me)](future<> f) { // must keep object alive until here.
                 f.ignore_ready_future();
-            });
+            }));
         }
     }
     // helper for sink
@@ -1452,26 +1681,202 @@ public:
         });
     }
 
-    seastar::net::connected_socket_impl & socket() const {
+    seastar::net::connected_socket_impl& socket() const {
         return *_sock;
+    }
+
+    // helper routine.
+    template<typename Func, typename... Args>
+    auto state_checked_access(Func&& f, Args&& ...args) {
+        using future_type = typename futurize<std::invoke_result_t<Func, Args...>>::type;
+        using result_t = typename future_type::value_type;
+        if (_error) {
+            return make_exception_future<result_t>(_error);
+        }
+        if (_shutdown) {
+            return make_exception_future<result_t>(std::system_error(ENOTCONN, std::system_category()));
+        }
+        if (!_connected) {
+            return handshake().then([this, f = std::move(f), ...args = std::forward<Args>(args)]() mutable {
+                // always recurse, in case malicious api caller does a shutdown while the above handshake is
+                // happening. I.e. misuses the api.
+                return session::state_checked_access(std::move(f), std::forward<Args>(args)...);
+            });
+        }
+        return futurize_invoke(f, std::forward<Args>(args)...);
+    }
+
+    future<bool> is_resumed() {
+        return state_checked_access([this] {
+            return gnutls_session_is_resumed(*this) != 0;
+        });
+    }
+    future<session_data> get_session_resume_data() {
+        return state_checked_access([this] {
+            /**
+             * Session ticket data is not available just because handshake
+             * was done. First off, of course other part must support it,
+             * but we also (mostly?) need to actually transfer data before
+             * the ticket is received.
+             *
+             * Check session flags so we can return no data in the case
+             * none is avail. Gnutls returns a 4-byte "empty marker"
+             * on none avail.
+            */
+            auto flags = gnutls_session_get_flags(*this);
+            if ((flags & GNUTLS_SFLAGS_SESSION_TICKET) == 0) {
+                return session_data{};
+            }
+            gnutls_datum tmp;
+            gtls_chk(gnutls_session_get_data2(*this, &tmp));
+            return session_data(tmp.data, tmp.data + tmp.size);
+        });
+    }
+    future<std::optional<session_dn>> get_distinguished_name() {
+        return state_checked_access([this] {
+            return extract_dn_information();
+        });
+    }
+    future<std::vector<subject_alt_name>> get_alt_name_information(std::unordered_set<subject_alt_name_type> types) {
+        return state_checked_access([this](std::unordered_set<subject_alt_name_type> types) {
+            std::vector<subject_alt_name> res;
+
+            auto peer = get_peer_certificate();
+            if (!peer) {
+                return res;
+            }
+
+        	for (auto i = 0u; ; i++) {
+                size_t size = 0;
+
+                auto err = gnutls_x509_crt_get_subject_alt_name(peer.get(), i, nullptr, &size, nullptr);
+
+                if (err == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE) {
+                    break;
+                }
+                if (err != GNUTLS_E_SHORT_MEMORY_BUFFER) {
+                    gtls_chk(err); // will throw
+                }
+                sstring buf;
+                buf.resize(size);
+
+                err = gnutls_x509_crt_get_subject_alt_name(peer.get(), i, buf.data(), &size, nullptr);
+                if (err < 0) {
+                    gtls_chk(err); // will throw
+                }
+
+                static_assert(int(subject_alt_name_type::dnsname) == GNUTLS_SAN_DNSNAME);
+                static_assert(int(subject_alt_name_type::rfc822name) == GNUTLS_SAN_RFC822NAME);
+                static_assert(int(subject_alt_name_type::uri) == GNUTLS_SAN_URI);
+                static_assert(int(subject_alt_name_type::ipaddress) == GNUTLS_SAN_IPADDRESS);
+                static_assert(int(subject_alt_name_type::othername) == GNUTLS_SAN_OTHERNAME);
+                static_assert(int(subject_alt_name_type::dn) == GNUTLS_SAN_DN);
+
+                subject_alt_name v;
+
+                v.type = subject_alt_name_type(err);
+
+                if (!types.empty() && !types.count(v.type)) {
+                    continue;
+                }
+
+                switch (v.type) {
+                    case subject_alt_name_type::ipaddress:
+                    {
+                        union {
+                            char c;
+                            ::in_addr in;
+                            ::in6_addr in6;
+                        } tmp;
+
+                        memcpy(&tmp.c, buf.data(), size);
+                        if (size == sizeof(::in_addr)) {
+                            v.value = net::inet_address(tmp.in);
+                        } else if (size == sizeof(::in6_addr)) {
+                            v.value = net::inet_address(tmp.in6);
+                        } else {
+                            throw std::runtime_error(fmt::format("Unexpected size {} for ipaddress alt name value", size));
+                        }
+                        break;
+                    }
+                    default:
+                        // data we get back is null-terminated.
+                        while (buf.back() == 0) {
+                            buf.resize(buf.size() - 1);
+                        }
+                        v.value = std::move(buf);
+                        break;
+                }
+
+                res.emplace_back(std::move(v));
+        	}
+            return res;
+        }, std::move(types));
+    }
+
+    future<std::vector<certificate_data>> get_peer_certificate_chain() {
+        return state_checked_access([this] {
+            unsigned int list_size = 0;
+            const gnutls_datum_t* client_cert_list = gnutls_certificate_get_peers(*this, &list_size);
+            auto res = std::vector<certificate_data>{};
+            res.reserve(list_size);
+            if (client_cert_list) {
+                for (auto const& client_cert : std::span{client_cert_list, list_size}) {
+                    res.emplace_back(client_cert.size);
+                    std::copy_n(client_cert.data, client_cert.size, res.back().data());
+                }
+            }
+            return res;
+        });
     }
 
     struct session_ref;
 private:
+
+    using x509_ctr_ptr = std::unique_ptr<gnutls_x509_crt_int, void (*)(gnutls_x509_crt_t)>;
+
+    x509_ctr_ptr get_peer_certificate() const {
+        unsigned int list_size = 0;
+        const gnutls_datum_t* client_cert_list = gnutls_certificate_get_peers(*this, &list_size);
+        if (client_cert_list && list_size > 0) {
+            gnutls_x509_crt_t peer_leaf_cert = nullptr;
+            gtls_chk(gnutls_x509_crt_init(&peer_leaf_cert));
+
+            x509_ctr_ptr res(peer_leaf_cert, &gnutls_x509_crt_deinit);
+            gtls_chk(gnutls_x509_crt_import(peer_leaf_cert, &(client_cert_list[0]), GNUTLS_X509_FMT_DER));
+            return res;
+        }
+        return x509_ctr_ptr(nullptr, &gnutls_x509_crt_deinit);
+    }
+
+    std::optional<session_dn> extract_dn_information() const {
+        auto peer_leaf_cert = get_peer_certificate();
+        if (!peer_leaf_cert) {
+            return std::nullopt;
+        }
+        auto [ec, subject] = get_gtls_string(gnutls_x509_crt_get_dn, peer_leaf_cert.get());
+        auto [ec2, issuer] = get_gtls_string(gnutls_x509_crt_get_issuer_dn, peer_leaf_cert.get());
+        if (ec || ec2) {
+            throw std::runtime_error("error while extracting certificate DN strings");
+        }
+        return session_dn{.subject=subject, .issuer=issuer};
+    }
+
     type _type;
 
     std::unique_ptr<net::connected_socket_impl> _sock;
     shared_ptr<tls::certificate_credentials::impl> _creds;
-    const sstring _hostname;
     data_source _in;
     data_sink _out;
 
     semaphore _in_sem, _out_sem;
 
+    tls_options _options;
+
     bool _eof = false;
     bool _shutdown = false;
     bool _connected = false;
-    bool _error = false;
+    std::exception_ptr _error;
 
     future<> _output_pending;
     buf_type _input;
@@ -1511,6 +1916,7 @@ public:
     class source_impl;
     class sink_impl;
 
+    using net::connected_socket_impl::source;
     data_source source() override;
     data_sink sink() override;
 
@@ -1543,6 +1949,30 @@ public:
     }
     int get_sockopt(int level, int optname, void* data, size_t len) const override {
         return _session->socket().get_sockopt(level, optname, data, len);
+    }
+    socket_address local_address() const noexcept override {
+        return _session->socket().local_address();
+    }
+    socket_address remote_address() const noexcept override {
+        return _session->socket().remote_address();
+    }
+    future<std::optional<session_dn>> get_distinguished_name() {
+        return _session->get_distinguished_name();
+    }
+    future<std::vector<subject_alt_name>> get_alt_name_information(std::unordered_set<subject_alt_name_type> types) {
+        return _session->get_alt_name_information(std::move(types));
+    }
+    future<std::vector<certificate_data>> get_peer_certificate_chain() {
+        return _session->get_peer_certificate_chain();
+    }
+    future<> wait_input_shutdown() override {
+        return _session->socket().wait_input_shutdown();
+    }
+    future<bool> check_session_is_resumed() {
+        return _session->is_resumed();
+    }
+    future<session_data> get_session_resume_data() {
+        return _session->get_session_resume_data();
     }
 };
 
@@ -1579,6 +2009,10 @@ private:
         _session->close();
         return make_ready_future<>();
     }
+    bool can_batch_flushes() const noexcept override { return true; }
+    void on_batch_flush_error() noexcept override {
+        _session->close();
+    }
 };
 
 class server_session : public net::server_socket_impl {
@@ -1603,21 +2037,22 @@ public:
         return _sock.local_address();
     }
 private:
+
     shared_ptr<server_credentials> _creds;
     server_socket _sock;
 };
 
 class tls_socket_impl : public net::socket_impl {
     shared_ptr<certificate_credentials> _cred;
-    sstring _name;
+    tls_options _options;
     ::seastar::socket _socket;
 public:
-    tls_socket_impl(shared_ptr<certificate_credentials> cred, sstring name)
-            : _cred(cred), _name(std::move(name)), _socket(make_socket()) {
+    tls_socket_impl(shared_ptr<certificate_credentials> cred, tls_options options)
+            : _cred(cred), _options(std::move(options)), _socket(make_socket()) {
     }
     virtual future<connected_socket> connect(socket_address sa, socket_address local, transport proto = transport::TCP) override {
-        return _socket.connect(sa, local, proto).then([cred = std::move(_cred), name = std::move(_name)](connected_socket s) mutable {
-            return wrap_client(cred, std::move(s), std::move(name));
+        return _socket.connect(sa, local, proto).then([cred = std::move(_cred), options = std::move(_options)](connected_socket s) mutable {
+            return wrap_client(cred, std::move(s), std::move(options));
         });
     }
     void set_reuseaddr(bool reuseaddr) override {
@@ -1643,23 +2078,43 @@ data_sink tls::tls_connected_socket_impl::sink() {
 
 
 future<connected_socket> tls::connect(shared_ptr<certificate_credentials> cred, socket_address sa, sstring name) {
-    return engine().connect(sa).then([cred = std::move(cred), name = std::move(name)](connected_socket s) mutable {
-        return wrap_client(cred, std::move(s), std::move(name));
-    });
+    tls_options options{.server_name = std::move(name)};
+    return connect(std::move(cred), std::move(sa), std::move(options));
 }
 
 future<connected_socket> tls::connect(shared_ptr<certificate_credentials> cred, socket_address sa, socket_address local, sstring name) {
-    return engine().connect(sa, local).then([cred = std::move(cred), name = std::move(name)](connected_socket s) mutable {
-        return wrap_client(cred, std::move(s), std::move(name));
+    tls_options options{.server_name = std::move(name)};
+    return connect(std::move(cred), std::move(sa), std::move(local), std::move(options));
+}
+
+future<connected_socket> tls::connect(shared_ptr<certificate_credentials> cred, socket_address sa, tls_options options) {
+    return engine().connect(sa).then([cred = std::move(cred), options = std::move(options)](connected_socket s) mutable {
+        return wrap_client(std::move(cred), std::move(s), std::move(options));
+    });
+}
+
+future<connected_socket> tls::connect(shared_ptr<certificate_credentials> cred, socket_address sa, socket_address local, tls_options options) {
+    return engine().connect(sa, local).then([cred = std::move(cred), options = std::move(options)](connected_socket s) mutable {
+        return wrap_client(std::move(cred), std::move(s), std::move(options));
     });
 }
 
 socket tls::socket(shared_ptr<certificate_credentials> cred, sstring name) {
-    return ::seastar::socket(std::make_unique<tls_socket_impl>(std::move(cred), std::move(name)));
+    tls_options options{.server_name = std::move(name)};
+    return tls::socket(std::move(cred), std::move(options));
+}
+
+socket tls::socket(shared_ptr<certificate_credentials> cred, tls_options options) {
+    return ::seastar::socket(std::make_unique<tls_socket_impl>(std::move(cred), std::move(options)));
 }
 
 future<connected_socket> tls::wrap_client(shared_ptr<certificate_credentials> cred, connected_socket&& s, sstring name) {
-    session::session_ref sess(make_lw_shared<session>(session::type::CLIENT, std::move(cred), std::move(s), std::move(name)));
+    tls_options options{.server_name = std::move(name)};
+    return wrap_client(std::move(cred), std::move(s), std::move(options));
+}
+
+future<connected_socket> tls::wrap_client(shared_ptr<certificate_credentials> cred, connected_socket&& s, tls_options options) {
+    session::session_ref sess(make_lw_shared<session>(session::type::CLIENT, std::move(cred), std::move(s),  options));
     connected_socket sock(std::make_unique<tls_connected_socket_impl>(std::move(sess)));
     return make_ready_future<connected_socket>(std::move(sock));
 }
@@ -1679,4 +2134,91 @@ server_socket tls::listen(shared_ptr<server_credentials> creds, server_socket ss
     return server_socket(std::move(ssls));
 }
 
+static tls::tls_connected_socket_impl* get_tls_socket(connected_socket& socket) {
+    auto impl = net::get_impl::maybe_get_ptr(socket);
+    if (impl == nullptr) {
+        // the socket is not yet created or moved from
+        throw std::system_error(ENOTCONN, std::system_category());
+    }
+    auto tls_impl = dynamic_cast<tls::tls_connected_socket_impl*>(impl);
+    if (!tls_impl) {
+        // bad cast here means that we're dealing with wrong socket type
+        throw std::invalid_argument("Not a TLS socket");
+    }
+    return tls_impl;
 }
+
+future<std::optional<session_dn>> tls::get_dn_information(connected_socket& socket) {
+    return get_tls_socket(socket)->get_distinguished_name();
+}
+
+future<std::vector<tls::subject_alt_name>> tls::get_alt_name_information(connected_socket& socket, std::unordered_set<subject_alt_name_type> types) {
+    return get_tls_socket(socket)->get_alt_name_information(std::move(types));
+}
+
+future<std::vector<tls::certificate_data>> tls::get_peer_certificate_chain(connected_socket& socket) {
+    return get_tls_socket(socket)->get_peer_certificate_chain();
+}
+
+future<bool> tls::check_session_is_resumed(connected_socket& socket) {
+    return get_tls_socket(socket)->check_session_is_resumed();
+}
+
+future<tls::session_data> tls::get_session_resume_data(connected_socket& socket) {
+    return get_tls_socket(socket)->get_session_resume_data();
+}
+
+std::string_view tls::format_as(subject_alt_name_type type) {
+    switch (type) {
+        case subject_alt_name_type::dnsname:
+            return "DNS";
+        case subject_alt_name_type::rfc822name:
+            return "EMAIL";
+        case subject_alt_name_type::uri:
+            return "URI";
+        case subject_alt_name_type::ipaddress:
+            return "IP";
+        case subject_alt_name_type::othername:
+            return "OTHERNAME";
+        case subject_alt_name_type::dn:
+            return "DIRNAME";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+std::ostream& tls::operator<<(std::ostream& os, subject_alt_name_type type) {
+    return os << format_as(type);
+}
+
+std::ostream& tls::operator<<(std::ostream& os, const subject_alt_name::value_type& v) {
+    fmt::print(os, "{}", v);
+    return os;
+}
+
+std::ostream& tls::operator<<(std::ostream& os, const subject_alt_name& a) {
+    fmt::print(os, "{}", a);
+    return os;
+}
+
+
+}
+
+const int seastar::tls::ERROR_UNKNOWN_COMPRESSION_ALGORITHM = GNUTLS_E_UNKNOWN_COMPRESSION_ALGORITHM;
+const int seastar::tls::ERROR_UNKNOWN_CIPHER_TYPE = GNUTLS_E_UNKNOWN_CIPHER_TYPE;
+const int seastar::tls::ERROR_INVALID_SESSION = GNUTLS_E_INVALID_SESSION;
+const int seastar::tls::ERROR_UNEXPECTED_HANDSHAKE_PACKET = GNUTLS_E_UNEXPECTED_HANDSHAKE_PACKET;
+const int seastar::tls::ERROR_UNKNOWN_CIPHER_SUITE = GNUTLS_E_UNKNOWN_CIPHER_SUITE;
+const int seastar::tls::ERROR_UNKNOWN_ALGORITHM = GNUTLS_E_UNKNOWN_ALGORITHM;
+const int seastar::tls::ERROR_UNSUPPORTED_SIGNATURE_ALGORITHM = GNUTLS_E_UNSUPPORTED_SIGNATURE_ALGORITHM;
+const int seastar::tls::ERROR_SAFE_RENEGOTIATION_FAILED = GNUTLS_E_SAFE_RENEGOTIATION_FAILED;
+const int seastar::tls::ERROR_UNSAFE_RENEGOTIATION_DENIED = GNUTLS_E_UNSAFE_RENEGOTIATION_DENIED;
+const int seastar::tls::ERROR_UNKNOWN_SRP_USERNAME = GNUTLS_E_UNKNOWN_SRP_USERNAME;
+const int seastar::tls::ERROR_PREMATURE_TERMINATION = GNUTLS_E_PREMATURE_TERMINATION;
+const int seastar::tls::ERROR_PUSH = GNUTLS_E_PUSH_ERROR;
+const int seastar::tls::ERROR_PULL = GNUTLS_E_PULL_ERROR;
+const int seastar::tls::ERROR_UNEXPECTED_PACKET = GNUTLS_E_UNEXPECTED_PACKET;
+const int seastar::tls::ERROR_UNSUPPORTED_VERSION = GNUTLS_E_UNSUPPORTED_VERSION_PACKET;
+const int seastar::tls::ERROR_NO_CIPHER_SUITES = GNUTLS_E_NO_CIPHER_SUITES;
+const int seastar::tls::ERROR_DECRYPTION_FAILED = GNUTLS_E_DECRYPTION_FAILED;
+const int seastar::tls::ERROR_MAC_VERIFY_FAILED = GNUTLS_E_MAC_VERIFY_FAILED;

@@ -20,10 +20,10 @@
 #ifdef SEASTAR_HAVE_DPDK
 
 #include <bitset>
+#include <optional>
 #include <rte_config.h>
 #include <rte_ethdev.h>
 #include <rte_version.h>
-#include <boost/program_options.hpp>
 
 /*********************** Compat section ***************************************/
 // We currently support only versions 2.0 and above.
@@ -31,6 +31,10 @@
 #error "DPDK version above 2.0.0 is required"
 #endif
 
+#if defined(RTE_MBUF_REFCNT_ATOMIC)
+#warning "CONFIG_RTE_MBUF_REFCNT_ATOMIC should be disabled in DPDK's " \
+         "config/common_linuxapp"
+#endif
 /******************************************************************************/
 
 namespace seastar {
@@ -42,7 +46,7 @@ class eal {
 public:
     using cpuset = std::bitset<RTE_MAX_LCORE>;
 
-    static void init(cpuset cpus, boost::program_options::variables_map opts);
+    static void init(cpuset cpus, const std::string& argv0, const std::optional<std::string>& hugepages_path, bool dpdk_pmd);
     /**
      * Returns the amount of memory needed for DPDK
      * @param num_cpus Number of CPUs the application is going to use

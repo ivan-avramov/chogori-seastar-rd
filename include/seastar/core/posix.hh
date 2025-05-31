@@ -21,32 +21,41 @@
 
 #pragma once
 
-#include <seastar/core/sstring.hh>
-#include "abort_on_ebadf.hh"
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <assert.h>
-#include <utility>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <sys/eventfd.h>
-#include <sys/timerfd.h>
-#include <sys/socket.h>
+#ifndef SEASTAR_MODULE
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <signal.h>
-#include <system_error>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/timerfd.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <assert.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
-#include <memory>
+#include <spawn.h>
+#include <unistd.h>
+#include <utility>
+#include <system_error>
 #include <chrono>
-#include <sys/uio.h>
-
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <set>
+#include <optional>
+#endif
+#include "abort_on_ebadf.hh"
+#include <seastar/core/sstring.hh>
 #include <seastar/net/socket_defs.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/modules.hh>
 
 namespace seastar {
+
+SEASTAR_MODULE_EXPORT_BEGIN
 
 /// \file
 /// \defgroup posix-support POSIX Support
@@ -61,6 +70,9 @@ inline void throw_system_error_on(bool condition, const char* what_arg = "");
 
 template <typename T>
 inline void throw_kernel_error(T r);
+
+template <typename T>
+inline void throw_pthread_error(T r);
 
 struct mmap_deleter {
     size_t _size;
@@ -89,12 +101,14 @@ public:
         return *this;
     }
     void close() {
-        assert(_fd != -1);
+        SEASTAR_ASSERT(_fd != -1);
         auto r = ::close(_fd);
         throw_system_error_on(r == -1, "close");
         _fd = -1;
     }
     int get() const { return _fd; }
+
+    sstring fdinfo() const noexcept;
 
     static file_desc from_fd(int fd) {
         return file_desc(fd);
@@ -282,6 +296,12 @@ public:
         throw_system_error_on(r == -1, "getsockname");
         return addr;
     }
+    socket_address get_remote_address() {
+        socket_address addr;
+        auto r = ::getpeername(_fd, &addr.u.sa, &addr.addr_length);
+        throw_system_error_on(r == -1, "getpeername");
+        return addr;
+    }
     void listen(int backlog) {
         auto fd = ::listen(_fd, backlog);
         throw_system_error_on(fd == -1, "listen");
@@ -335,12 +355,25 @@ public:
         return map(size, PROT_READ, MAP_PRIVATE, offset);
     }
 
+    void spawn_actions_add_close(posix_spawn_file_actions_t* actions) {
+        auto r = ::posix_spawn_file_actions_addclose(actions, _fd);
+        throw_pthread_error(r);
+    }
+
+    void spawn_actions_add_dup2(posix_spawn_file_actions_t* actions, int newfd) {
+        auto r = ::posix_spawn_file_actions_adddup2(actions, _fd, newfd);
+        throw_pthread_error(r);
+    }
 private:
     file_desc(int fd) : _fd(fd) {}
  };
 
 
 namespace posix {
+
+constexpr unsigned rcv_shutdown = 0x1;
+constexpr unsigned snd_shutdown = 0x2;
+inline constexpr unsigned shutdown_mask(int how) { return how + 1; }
 
 /// Converts a duration value to a `timespec`
 ///
@@ -417,8 +450,10 @@ public:
             set(std::forward<Rest>(rest)...);
         }
         void set(stack_size ss) { _stack_size = ss; }
+        void set(cpu_set_t affinity) { _affinity = affinity; }
     private:
         stack_size _stack_size;
+        std::optional<cpu_set_t> _affinity;
         friend class posix_thread;
     };
 };
@@ -437,7 +472,7 @@ void throw_system_error_on(bool condition, const char* what_arg) {
 template <typename T>
 inline
 void throw_kernel_error(T r) {
-    static_assert(std::is_signed<T>::value, "kernel error variables must be signed");
+    static_assert(std::is_signed_v<T>, "kernel error variables must be signed");
     if (r < 0) {
         auto ec = -r;
         if ((ec == EBADF || ec == ENOTSOCK) && is_abort_on_ebadf_enabled()) {
@@ -483,10 +518,13 @@ void pin_this_thread(unsigned cpu_id) {
     CPU_ZERO(&cs);
     CPU_SET(cpu_id, &cs);
     auto r = pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
-    assert(r == 0);
+    SEASTAR_ASSERT(r == 0);
     (void)r;
 }
 
+std::set<unsigned> get_current_cpuset();
+
 /// @}
 
+SEASTAR_MODULE_EXPORT_END
 }

@@ -21,6 +21,17 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
+#include <unordered_map>
+#include <map>
+#include <functional>
+#include <deque>
+#include <chrono>
+#include <random>
+#include <stdexcept>
+#include <system_error>
+#include <gnutls/crypto.h>
+#endif
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/semaphore.hh>
@@ -31,18 +42,8 @@
 #include <seastar/net/ip.hh>
 #include <seastar/net/const.hh>
 #include <seastar/net/packet-util.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/std-compat.hh>
-#include <unordered_map>
-#include <map>
-#include <functional>
-#include <deque>
-#include <chrono>
-#include <random>
-#include <stdexcept>
-#include <system_error>
-
-#define CRYPTOPP_ENABLE_NAMESPACE_WEAK 1
-#include <cryptopp/md5.h>
 
 namespace seastar {
 
@@ -316,6 +317,7 @@ private:
         tcp& _tcp;
         connection* _conn = nullptr;
         promise<> _connect_done;
+        std::optional<promise<>> _fin_recvd_promise = promise<>();
         ipaddr _local_ip;
         ipaddr _foreign_ip;
         uint16_t _local_port;
@@ -430,13 +432,14 @@ private:
         void input_handle_other_state(tcp_hdr* th, packet p);
         void output_one(bool data_retransmit = false);
         future<> wait_for_data();
-        void abort_reader();
+        future<> wait_input_shutdown();
+        void abort_reader() noexcept;
         future<> wait_for_all_data_acked();
         future<> wait_send_available();
         future<> send(packet p);
         void connect();
         packet read();
-        future<> close();
+        future<> close() noexcept;
         void remove_from_tcbs() {
             auto id = connid{_local_ip, _foreign_ip, _local_port, _foreign_port};
             _tcp._tcbs.erase(id);
@@ -475,7 +478,7 @@ private:
         void insert_out_of_order(tcp_seq seq, packet p);
         void trim_receive_data_after_window();
         bool should_send_ack(uint16_t seg_len);
-        void clear_delayed_ack();
+        void clear_delayed_ack() noexcept;
         packet get_transmit_packet();
         void retransmit_one() {
             bool data_retransmit = true;
@@ -489,7 +492,7 @@ private:
             auto tp = now + _rto;
             _retransmit.rearm(tp);
         };
-        void stop_retransmit_timer() {
+        void stop_retransmit_timer() noexcept {
             _retransmit.cancel();
         };
         void start_persist_timer() {
@@ -625,20 +628,20 @@ private:
             _snd.unacknowledged += 1;
             _snd.next += 1;
         }
-        bool syn_needs_on() {
+        bool syn_needs_on() const noexcept {
             return in_state(SYN_SENT | SYN_RECEIVED);
         }
-        bool fin_needs_on() {
+        bool fin_needs_on() const noexcept {
             return in_state(FIN_WAIT_1 | CLOSING | LAST_ACK) && _snd.closed &&
                    _snd.unsent_len == 0;
         }
-        bool ack_needs_on() {
+        bool ack_needs_on() const noexcept {
             return !in_state(CLOSED | LISTEN | SYN_SENT);
         }
-        bool foreign_will_not_send() {
+        bool foreign_will_not_send() const noexcept {
             return in_state(CLOSING | TIME_WAIT | CLOSE_WAIT | LAST_ACK | CLOSED);
         }
-        bool in_state(tcp_state state) {
+        bool in_state(tcp_state state) const noexcept {
             return uint16_t(_state) & uint16_t(state);
         }
         void exit_fast_recovery() {
@@ -692,6 +695,9 @@ public:
         future<> wait_for_data() {
             return _tcb->wait_for_data();
         }
+        future<> wait_input_shutdown() {
+            return _tcb->wait_input_shutdown();
+        }
         packet read() {
             return _tcb->read();
         }
@@ -701,9 +707,15 @@ public:
         uint16_t foreign_port() {
             return _tcb->_foreign_port;
         }
+        ipaddr local_ip() {
+            return _tcb->_local_ip;
+        }
+        uint16_t local_port() {
+            return _tcb->_local_port;
+        }
         void shutdown_connect();
-        void close_read();
-        future<> close_write();
+        void close_read() noexcept;
+        future<> close_write() noexcept;
     };
     class listener {
         tcp& _tcp;
@@ -727,9 +739,7 @@ public:
             }
         }
         future<connection> accept() {
-            return _q.not_empty().then([this] {
-                return make_ready_future<connection>(_q.pop());
-            });
+            return _q.pop_eventually();
         }
         void abort_accept() {
             _q.abort(std::make_exception_ptr(std::system_error(ECONNABORTED, std::system_category())));
@@ -774,7 +784,7 @@ tcp<InetTraits>::tcp(inet_type& inet)
     namespace sm = metrics;
 
     _metrics.add_group("tcp", {
-        sm::make_derive("linearizations", [] { return tcp_packet_merger::linearizations(); },
+        sm::make_counter("linearizations", [] { return tcp_packet_merger::linearizations(); },
                         sm::description("Counts a number of times a buffer linearization was invoked during the buffers merge process. "
                                         "Divide it by a total TCP receive packet rate to get an everage number of lineraizations per TCP packet."))
     });
@@ -818,18 +828,19 @@ auto tcp<InetTraits>::listen(uint16_t port, size_t queue_length) -> listener {
 
 template <typename InetTraits>
 auto tcp<InetTraits>::connect(socket_address sa) -> connection {
-    uint16_t src_port;
     connid id;
     auto src_ip = _inet._inet.host_address();
     auto dst_ip = ipv4_address(sa);
     auto dst_port = net::ntoh(sa.u.in.sin_port);
 
-    do {
-        src_port = _port_dist(_e);
-        id = connid{src_ip, dst_ip, src_port, dst_port};
-    } while (_inet._inet.netif()->hw_queues_count() > 1 &&
-             (_inet._inet.netif()->hash2cpu(id.hash(_inet._inet.netif()->rss_key())) != this_shard_id()
-              || _tcbs.find(id) != _tcbs.end()));
+    if (smp::count > 1) {
+        do {
+            id = connid{src_ip, dst_ip, _port_dist(_e), dst_port};
+        } while (_inet._inet.netif()->hash2cpu(id.hash(_inet._inet.netif()->rss_key())) != this_shard_id()
+                 || _tcbs.find(id) != _tcbs.end());
+    } else {
+        id = connid{src_ip, dst_ip, _port_dist(_e), dst_port};
+    }
 
     auto tcbp = make_lw_shared<tcb>(*this, id);
     _tcbs.insert({id, tcbp});
@@ -1157,6 +1168,7 @@ void tcp<InetTraits>::tcb::input_handle_syn_sent_state(tcp_hdr* th, packet p) {
         // reset", drop the segment, enter CLOSED state, delete TCB, and
         // return.  Otherwise (no ACK) drop the segment and return.
         if (acceptable) {
+            _connect_done.set_exception(tcp_refused_error());
             return do_reset();
         } else {
             return;
@@ -1515,6 +1527,10 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
 
     // 4.8 eighth, check the FIN bit
     if (th->f_fin) {
+        if (_fin_recvd_promise) {
+            _fin_recvd_promise->set_value();
+            _fin_recvd_promise.reset();
+        }
         if (in_state(CLOSED | LISTEN | SYN_SENT)) {
             // Do not process the FIN if the state is CLOSED, LISTEN or SYN-SENT
             // since the SEG.SEQ cannot be validated; drop the segment and return.
@@ -1715,7 +1731,7 @@ void tcp<InetTraits>::tcb::output_one(bool data_retransmit) {
     // if advertised TCP receive window is 0 we may only transmit zero window probing segment.
     // Payload size of this segment is 1. Queueing anything bigger when _snd.window == 0 is bug
     // and violation of RFC
-    assert((_snd.window > 0) || ((_snd.window == 0) && (len <= 1)));
+    SEASTAR_ASSERT((_snd.window > 0) || ((_snd.window == 0) && (len <= 1)));
     queue_packet(std::move(p));
 }
 
@@ -1729,12 +1745,24 @@ future<> tcp<InetTraits>::tcb::wait_for_data() {
 }
 
 template <typename InetTraits>
+future<> tcp<InetTraits>::tcb::wait_input_shutdown() {
+    if (!_fin_recvd_promise) {
+        return make_ready_future<>();
+    }
+    return _fin_recvd_promise->get_future();
+}
+
+template <typename InetTraits>
 void
-tcp<InetTraits>::tcb::abort_reader() {
+tcp<InetTraits>::tcb::abort_reader() noexcept {
     if (_rcv._data_received_promise) {
         _rcv._data_received_promise->set_exception(
                 std::make_exception_ptr(std::system_error(ECONNABORTED, std::system_category())));
         _rcv._data_received_promise = std::nullopt;
+    }
+    if (_fin_recvd_promise) {
+        _fin_recvd_promise->set_value();
+        _fin_recvd_promise.reset();
     }
 }
 
@@ -1804,7 +1832,7 @@ future<> tcp<InetTraits>::tcb::send(packet p) {
 }
 
 template <typename InetTraits>
-future<> tcp<InetTraits>::tcb::close() {
+future<> tcp<InetTraits>::tcb::close() noexcept {
     if (in_state(CLOSED) || _snd.closed) {
         return make_ready_future();
     }
@@ -1859,7 +1887,7 @@ bool tcp<InetTraits>::tcb::should_send_ack(uint16_t seg_len) {
 }
 
 template <typename InetTraits>
-void tcp<InetTraits>::tcb::clear_delayed_ack() {
+void tcp<InetTraits>::tcb::clear_delayed_ack() noexcept {
     _delayed_ack.cancel();
 }
 
@@ -2061,8 +2089,14 @@ tcp_seq tcp<InetTraits>::tcb::get_isn() {
     hash[0] = _local_ip.ip;
     hash[1] = _foreign_ip.ip;
     hash[2] = (_local_port << 16) + _foreign_port;
-    hash[3] = _isn_secret.key[15];
-    CryptoPP::Weak::MD5::Transform(hash, _isn_secret.key);
+    gnutls_hash_hd_t md5_hash_handle;
+    // GnuTLS digests do not init at all, so this should never fail.
+    gnutls_hash_init(&md5_hash_handle, GNUTLS_DIG_MD5);
+    gnutls_hash(md5_hash_handle, hash, 3 * sizeof(hash[0]));
+    gnutls_hash(md5_hash_handle, _isn_secret.key, sizeof(_isn_secret.key));
+    // reuse "hash" for the output of digest
+    SEASTAR_ASSERT(sizeof(hash) == gnutls_hash_get_len(GNUTLS_DIG_MD5));
+    gnutls_hash_deinit(md5_hash_handle, hash);
     auto seq = hash[0];
     auto m = duration_cast<microseconds>(clock_type::now().time_since_epoch());
     seq += m.count() / 4;
@@ -2080,7 +2114,7 @@ std::optional<typename InetTraits::l4packet> tcp<InetTraits>::tcb::get_packet() 
         return std::optional<typename InetTraits::l4packet>();
     }
 
-    assert(!_packetq.empty());
+    SEASTAR_ASSERT(!_packetq.empty());
 
     auto p = std::move(_packetq.front());
     _packetq.pop_front();
@@ -2095,12 +2129,12 @@ std::optional<typename InetTraits::l4packet> tcp<InetTraits>::tcb::get_packet() 
 }
 
 template <typename InetTraits>
-void tcp<InetTraits>::connection::close_read() {
+void tcp<InetTraits>::connection::close_read() noexcept {
     _tcb->abort_reader();
 }
 
 template <typename InetTraits>
-future<> tcp<InetTraits>::connection::close_write() {
+future<> tcp<InetTraits>::connection::close_write() noexcept {
     return _tcb->close();
 }
 
@@ -2114,18 +2148,6 @@ void tcp<InetTraits>::connection::shutdown_connect() {
         (void)close_write();
     }
 }
-
-template <typename InetTraits>
-constexpr uint16_t tcp<InetTraits>::tcb::_max_nr_retransmit;
-
-template <typename InetTraits>
-constexpr std::chrono::milliseconds tcp<InetTraits>::tcb::_rto_min;
-
-template <typename InetTraits>
-constexpr std::chrono::milliseconds tcp<InetTraits>::tcb::_rto_max;
-
-template <typename InetTraits>
-constexpr std::chrono::milliseconds tcp<InetTraits>::tcb::_rto_clk_granularity;
 
 template <typename InetTraits>
 typename tcp<InetTraits>::tcb::isn_secret tcp<InetTraits>::tcb::_isn_secret;

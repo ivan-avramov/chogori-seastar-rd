@@ -32,7 +32,7 @@
 #include <fmt/printf.h>
 #include <chrono>
 #include <cmath>
-#include <boost/range/irange.hpp>
+#include <ranges>
 
 using namespace seastar;
 using namespace std::chrono_literals;
@@ -78,7 +78,7 @@ future<>
 run_compute_intensive_tasks(seastar::scheduling_group sg, done_func done, unsigned concurrency, unsigned& counter, std::function<future<> (unsigned& counter)> task) {
     return seastar::async([task = std::move(task), sg, concurrency, done, &counter] () mutable {
         while (!done()) {
-            parallel_for_each(boost::irange(0u, concurrency), [task, sg, &counter] (unsigned i) mutable {
+            parallel_for_each(std::views::iota(0u, concurrency), [task, sg, &counter] (unsigned i) mutable {
                 return with_scheduling_group(sg, [task, &counter] {
                     return task(counter);
                 });
@@ -92,7 +92,7 @@ future<>
 run_compute_intensive_tasks_in_threads(seastar::scheduling_group sg, done_func done, unsigned concurrency, unsigned& counter, std::function<future<> (unsigned& counter)> task) {
     auto attr = seastar::thread_attributes();
     attr.sched_group = sg;
-    return parallel_for_each(boost::irange(0u, concurrency), [attr, done, &counter, task] (unsigned i) {
+    return parallel_for_each(std::views::iota(0u, concurrency), [attr, done, &counter, task] (unsigned i) {
         return seastar::async(attr, [done, &counter, task] {
             while (!done()) {
                 task(counter).get();
@@ -140,12 +140,12 @@ int main(int ac, char** av) {
     app_template app;
     return app.run(ac, av, [] {
         return seastar::async([] {
-            auto sg100 = seastar::create_scheduling_group("sg100", 100).get0();
-            auto ksg100 = seastar::defer([&] { seastar::destroy_scheduling_group(sg100).get(); });
-            auto sg20 = seastar::create_scheduling_group("sg20", 20).get0();
-            auto ksg20 = seastar::defer([&] { seastar::destroy_scheduling_group(sg20).get(); });
-            auto sg50 = seastar::create_scheduling_group("sg50", 50).get0();
-            auto ksg50 = seastar::defer([&] { seastar::destroy_scheduling_group(sg50).get(); });
+            auto sg100 = seastar::create_scheduling_group("sg100", 100).get();
+            auto ksg100 = seastar::defer([&] () noexcept { seastar::destroy_scheduling_group(sg100).get(); });
+            auto sg20 = seastar::create_scheduling_group("sg20", 20).get();
+            auto ksg20 = seastar::defer([&] () noexcept { seastar::destroy_scheduling_group(sg20).get(); });
+            auto sg50 = seastar::create_scheduling_group("sg50", 50).get();
+            auto ksg50 = seastar::defer([&] () noexcept { seastar::destroy_scheduling_group(sg50).get(); });
 
             bool done = false;
             auto end = timer<>([&done] {

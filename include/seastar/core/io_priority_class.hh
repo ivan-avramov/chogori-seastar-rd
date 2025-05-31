@@ -21,26 +21,26 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
+#include <seastar/core/sstring.hh>
+#include <seastar/core/future.hh>
+#include <seastar/util/modules.hh>
+
+#endif
+
 namespace seastar {
 
-/// \cond internal
 class io_queue;
+
+SEASTAR_MODULE_EXPORT_BEGIN
+
 using io_priority_class_id = unsigned;
-class io_priority_class {
-    io_priority_class_id _id;
-    friend io_queue;
 
-    io_priority_class() = delete;
-    explicit io_priority_class(io_priority_class_id id) noexcept
-        : _id(id)
-    { }
+SEASTAR_MODULE_EXPORT_END
 
-public:
-    io_priority_class_id id() const {
-        return _id;
-    }
+namespace internal {
+struct maybe_priority_class_ref {
 };
-
-const io_priority_class& default_priority_class();
+}
 
 } // namespace seastar

@@ -19,16 +19,26 @@
  * Copyright 2017 Marek Waszkiewicz ( marek.waszkiewicz77@gmail.com )
  */
 
-#include <seastar/net/config.hh>
-#include <seastar/core/print.hh>
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
 #include <boost/algorithm/cxx11/all_of.hpp>
 #include <boost/algorithm/cxx11/none_of.hpp>
 #include <boost/next_prior.hpp>
 #include <yaml-cpp/yaml.h>
 #include <algorithm>
 #include <istream>
+#include <optional>
 #include <unordered_map>
 #include <string>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
+#include <seastar/net/config.hh>
+#include <seastar/core/print.hh>
+#endif
 
 using namespace boost::algorithm;
 

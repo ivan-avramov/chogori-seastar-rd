@@ -1,6 +1,8 @@
-#include <seastar/util/std-compat.hh>
+#include <filesystem>
 #include <seastar/core/sstring.hh>
+#ifndef SEASTAR_MODULE
 #include <boost/lexical_cast.hpp>
+#endif
 
 namespace seastar {
 

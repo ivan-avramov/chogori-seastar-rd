@@ -21,18 +21,25 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
+#include <chrono>
 #include <memory>
 #include <vector>
 #include <cstring>
+#include <sys/types.h>
+#endif
+
 #include <seastar/core/future.hh>
 #include <seastar/net/byteorder.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/packet.hh>
+#include <seastar/core/internal/api-level.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/file-types.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/util/std-compat.hh>
-#include "../core/internal/api-level.hh"
-#include <sys/types.h>
+#include <seastar/util/program-options.hh>
+#include <seastar/util/modules.hh>
 
 namespace seastar {
 
@@ -78,44 +85,48 @@ class connected_socket_impl;
 class socket_impl;
 
 class server_socket_impl;
-class udp_channel_impl;
+class datagram_channel_impl;
 class get_impl;
 /// \endcond
 
-class udp_datagram_impl {
+class datagram_impl {
 public:
-    virtual ~udp_datagram_impl() {};
+    virtual ~datagram_impl() {};
     virtual socket_address get_src() = 0;
     virtual socket_address get_dst() = 0;
     virtual uint16_t get_dst_port() = 0;
     virtual packet& get_data() = 0;
 };
 
-class udp_datagram final {
+using udp_datagram_impl = datagram_impl;
+
+class datagram final {
 private:
-    std::unique_ptr<udp_datagram_impl> _impl;
+    std::unique_ptr<datagram_impl> _impl;
 public:
-    udp_datagram(std::unique_ptr<udp_datagram_impl>&& impl) noexcept : _impl(std::move(impl)) {};
+    datagram(std::unique_ptr<datagram_impl>&& impl) noexcept : _impl(std::move(impl)) {};
     socket_address get_src() { return _impl->get_src(); }
     socket_address get_dst() { return _impl->get_dst(); }
     uint16_t get_dst_port() { return _impl->get_dst_port(); }
     packet& get_data() { return _impl->get_data(); }
 };
 
-class udp_channel {
-private:
-    std::unique_ptr<udp_channel_impl> _impl;
-public:
-    udp_channel() noexcept;
-    udp_channel(std::unique_ptr<udp_channel_impl>) noexcept;
-    ~udp_channel();
+using udp_datagram = datagram;
 
-    udp_channel(udp_channel&&) noexcept;
-    udp_channel& operator=(udp_channel&&) noexcept;
+class datagram_channel {
+private:
+    std::unique_ptr<datagram_channel_impl> _impl;
+public:
+    datagram_channel() noexcept;
+    datagram_channel(std::unique_ptr<datagram_channel_impl>) noexcept;
+    ~datagram_channel();
+
+    datagram_channel(datagram_channel&&) noexcept;
+    datagram_channel& operator=(datagram_channel&&) noexcept;
 
     socket_address local_address() const;
 
-    future<udp_datagram> receive();
+    future<datagram> receive();
     future<> send(const socket_address& dst, const char* msg);
     future<> send(const socket_address& dst, packet p);
     bool is_closed() const;
@@ -130,6 +141,8 @@ public:
     /// shutdown_output().
     void close();
 };
+
+using udp_channel = datagram_channel;
 
 class network_interface_impl;
 
@@ -155,6 +168,12 @@ struct connected_socket_input_stream_config final {
     /// buffer sizes if it sees a tendency towards large requests, but will not go
     /// above this buffer size.
     unsigned max_buffer_size = 128 * 1024;
+};
+
+/// Distinguished name
+struct session_dn {
+    sstring subject;
+    sstring issuer;
 };
 
 /// A TCP (or other stream-based protocol) connection.
@@ -210,6 +229,10 @@ public:
     /// Linux users should refer to protocol-specific manuals
     /// to see available options, e.g. tcp(7), ip(7), etc.
     int get_sockopt(int level, int optname, void* data, size_t len) const;
+    /// Local address of the socket
+    socket_address local_address() const noexcept;
+    /// Remote address of the socket
+    socket_address remote_address() const noexcept;
 
     /// Disables output to the socket.
     ///
@@ -224,6 +247,29 @@ public:
     /// This is useful to abort operations on a socket that is not making
     /// progress due to a peer failure.
     void shutdown_input();
+    /// Check whether the \c connected_socket is initialized.
+    ///
+    /// \return true if this \c connected_socket socket_address is bound initialized
+    /// false otherwise.
+    ///
+    /// \see connect(socket_address sa)
+    /// \see connect(socket_address sa, socket_address local, transport proto)
+    explicit operator bool() const noexcept {
+        return static_cast<bool>(_csi);
+    }
+    /// Waits for the peer of this socket to disconnect
+    ///
+    /// \return future that resolves when the peer closes connection or shuts it down
+    /// for writing or when local socket is called \ref shutdown_input().
+    ///
+    /// Note, that when the returned future is resolved for whatever reason socket
+    /// may still be readable from, so the caller may want to wait for both events
+    /// -- this one and EOF from read.
+    ///
+    /// Calling it several times per socket is not allowed (undefined behavior)
+    ///
+    /// \see poll(2) about POLLRDHUP for more details
+    future<> wait_input_shutdown();
 };
 /// @}
 
@@ -294,7 +340,7 @@ public:
         fixed,
         default_ = connection_distribution
     };
-    /// Constructs a \c server_socket not corresponding to a connection
+    /// Constructs a \c server_socket without being bound to any address
     server_socket() noexcept;
     /// \cond internal
     explicit server_socket(std::unique_ptr<net::server_socket_impl> ssi) noexcept;
@@ -321,17 +367,53 @@ public:
     void abort_accept();
 
     /// Local bound address
+    ///
+    /// \return the local bound address if the \c server_socket is listening,
+    /// an empty address constructed with \c socket_address() otherwise.
+    ///
+    /// \see listen(socket_address sa)
+    /// \see listen(socket_address sa, listen_options opts)
     socket_address local_address() const noexcept;
+
+    /// Check whether the \c server_socket is listening on any address.
+    ///
+    /// \return true if this \c socket_address is bound to an address,
+    /// false if it is just created with the default constructor.
+    ///
+    /// \see listen(socket_address sa)
+    /// \see listen(socket_address sa, listen_options opts)
+    explicit operator bool() const noexcept {
+        return static_cast<bool>(_ssi);
+    }
 };
 
 /// @}
 
+/// Options for creating a listening socket.
+///
+/// WARNING: these options currently only have an effect when using
+/// the POSIX stack: all options are ignored on the native stack as they
+/// are not implemented there.
 struct listen_options {
     bool reuse_address = false;
     server_socket::load_balancing_algorithm lba = server_socket::load_balancing_algorithm::default_;
     transport proto = transport::TCP;
     int listen_backlog = 100;
     unsigned fixed_cpu = 0u;
+    std::optional<file_permissions> unix_domain_socket_permissions;
+
+    /// If set, the SO_SNDBUF size will be set to the given value on the listening socket
+    /// via setsockopt. This buffer size is inherited by the sockets returned by
+    /// accept and is the preferred way to set the buffer size for these sockets since
+    /// setting it directly on the already-accepted socket is ineffective (see TCP(7)).
+    std::optional<int> so_sndbuf;
+
+    /// If set, the SO_RCVBUF size will be set to the given value on the listening socket
+    /// via setsockopt. This buffer size is inherited by the sockets returned by
+    /// accept and is the preferred way to set the buffer size for these sockets since
+    /// setting it directly on the already-accepted socket is ineffective (see TCP(7)).
+    std::optional<int> so_rcvbuf;
+
     void set_fixed_cpu(unsigned cpu) {
         lba = server_socket::load_balancing_algorithm::fixed;
         fixed_cpu = cpu;
@@ -362,6 +444,19 @@ public:
     bool supports_ipv6() const;
 };
 
+struct statistics {
+    uint64_t bytes_sent = 0;
+    uint64_t bytes_received = 0;
+};
+
+namespace metrics {
+class metric_groups;
+class label_instance;
+}
+
+void register_net_metrics_for_scheduling_group(
+    metrics::metric_groups& m, unsigned sg_id, const metrics::label_instance& name);
+
 class network_stack {
 public:
     virtual ~network_stack() {}
@@ -369,7 +464,12 @@ public:
     // FIXME: local parameter assumes ipv4 for now, fix when adding other AF
     future<connected_socket> connect(socket_address sa, socket_address = {}, transport proto = transport::TCP);
     virtual ::seastar::socket socket() = 0;
+
+    [[deprecated("Use `make_[un]bound_datagram_channel` instead")]]
     virtual net::udp_channel make_udp_channel(const socket_address& = {}) = 0;
+
+    virtual net::datagram_channel make_unbound_datagram_channel(sa_family_t) = 0;
+    virtual net::datagram_channel make_bound_datagram_channel(const socket_address& local) = 0;
     virtual future<> initialize() {
         return make_ready_future();
     }
@@ -381,12 +481,26 @@ public:
         return false;
     }
 
-    /** 
-     * Returns available network interfaces. This represents a 
+    // Return network stats (bytes sent/received etc.) for this stack and scheduling group
+    virtual statistics stats(unsigned scheduling_group_id) = 0;
+    // Clears the stats for this stack and scheduling group
+    virtual void clear_stats(unsigned scheduling_group_id) = 0;
+
+    /**
+     * Returns available network interfaces. This represents a
      * snapshot of interfaces available at call time, hence the
      * return by value.
      */
     virtual std::vector<network_interface> network_interfaces();
+};
+
+struct network_stack_entry {
+    using factory_func = noncopyable_function<future<std::unique_ptr<network_stack>> (const program_options::option_group&)>;
+
+    sstring name;
+    std::unique_ptr<program_options::option_group> opts;
+    factory_func factory;
+    bool is_default;
 };
 
 }

@@ -19,14 +19,28 @@
  * Copyright (C) 2019 ScyllaDB Ltd.
  */
 
+
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <atomic>
+#include <cstdint>
+#include <array>
+#include <pthread.h>
+#include <signal.h>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/core/reactor.hh>
 #include "core/thread_pool.hh"
+#endif
+#include <seastar/util/assert.hh>
 
 namespace seastar {
 
-/* not yet implemented for OSv. TODO: do the notification like we do class smp. */
-#ifndef HAVE_OSV
-thread_pool::thread_pool(reactor* r, sstring name) : _reactor(r), _worker_thread([this, name] { work(name); }) {
+thread_pool::thread_pool(reactor& r, sstring name) : _reactor(r), _worker_thread([this, name] { work(name); }) {
 }
 
 void thread_pool::work(sstring name) {
@@ -39,7 +53,7 @@ void thread_pool::work(sstring name) {
     while (true) {
         uint64_t count;
         auto r = ::read(inter_thread_wq._start_eventfd.get_read_fd(), &count, sizeof(count));
-        assert(r == sizeof(count));
+        SEASTAR_ASSERT(r == sizeof(count));
         if (_stopped.load(std::memory_order_relaxed)) {
             break;
         }
@@ -51,10 +65,14 @@ void thread_pool::work(sstring name) {
             auto wi = *p;
             wi->process();
             inter_thread_wq._completed.push(wi);
-        }
-        if (_main_thread_idle.load(std::memory_order_seq_cst)) {
-            uint64_t one = 1;
-            ::write(_reactor->_notify_eventfd.get(), &one, 8);
+
+            // Prevent the following load of _main_thread_idle to be hoisted before the writes to _completed above.
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (_main_thread_idle.load(std::memory_order_relaxed)) {
+                uint64_t one = 1;
+                auto res = ::write(_reactor._notify_eventfd.get(), &one, 8);
+                SEASTAR_ASSERT(res == 8 && "write(2) failed on _reactor._notify_eventfd");
+            }
         }
     }
 }
@@ -64,6 +82,5 @@ thread_pool::~thread_pool() {
     inter_thread_wq._start_eventfd.signal(1);
     _worker_thread.join();
 }
-#endif
 
 }

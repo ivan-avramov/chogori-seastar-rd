@@ -22,10 +22,13 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
+#include <unordered_map>
+#endif
 #include <seastar/net/net.hh>
 #include <seastar/core/byteorder.hh>
 #include <seastar/net/ethernet.hh>
-#include <unordered_map>
+#include <seastar/util/modules.hh>
 
 namespace seastar {
 
@@ -44,7 +47,12 @@ public:
     arp_for_protocol(arp& a, uint16_t proto_num);
     virtual ~arp_for_protocol();
     virtual future<> received(packet p) = 0;
-    virtual bool forward(forward_hash& out_hash_data, packet& p, size_t off) { return false; }
+    virtual bool forward(forward_hash& out_hash_data, packet& p, size_t off) {
+      std::ignore = out_hash_data;
+      std::ignore = p;
+      std::ignore = off;
+      return false;
+    }
 };
 
 class arp {
@@ -70,7 +78,7 @@ public:
     void add(uint16_t proto_num, arp_for_protocol* afp);
     void del(uint16_t proto_num);
 private:
-    ethernet_address l2self() { return _netif->hw_address(); }
+    ethernet_address l2self() const noexcept { return _netif->hw_address(); }
     future<> process_packet(packet p, ethernet_address from);
     bool forward(forward_hash& out_hash_data, packet& p, size_t off);
     std::optional<l3_protocol::l3packet> get_packet();
@@ -140,7 +148,7 @@ private:
     packet make_query_packet(l3addr paddr);
     virtual future<> received(packet p) override;
     future<> handle_request(arp_hdr* ah);
-    l2addr l2self() { return _arp.l2self(); }
+    l2addr l2self() const noexcept { return _arp.l2self(); }
     void send(l2addr to, packet p);
 public:
     future<> send_query(const l3addr& paddr);

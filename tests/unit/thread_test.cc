@@ -29,8 +29,9 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/util/assert.hh>
 #include <sys/mman.h>
-#include <sys/signal.h>
+#include <signal.h>
 
 #include <valgrind/valgrind.h>
 
@@ -97,7 +98,7 @@ SEASTAR_TEST_CASE(test_thread_async_nested) {
     return async([] {
         return async([] {
             return 3;
-        }).get0();
+        }).get();
     }).then([] (int three) {
         BOOST_REQUIRE_EQUAL(three, 3);
     });
@@ -147,7 +148,7 @@ SEASTAR_TEST_CASE(test_asan_false_positive) {
 }
 #endif
 
-SEASTAR_THREAD_TEST_CASE_EXPECTED_FAILURES(abc, 2) {
+SEASTAR_THREAD_TEST_CASE(abc, *boost::unit_test::expected_failures(2)) {
     BOOST_TEST(false);
     BOOST_TEST(false);
 }
@@ -172,13 +173,13 @@ SEASTAR_TEST_CASE(test_thread_custom_stack_size) {
 // detect_stack_use_after_return=1 from the environment.
 #if defined(SEASTAR_THREAD_STACK_GUARDS) && defined(__x86_64__) && !defined(SEASTAR_ASAN_ENABLED)
 struct test_thread_custom_stack_size_failure : public seastar::testing::seastar_test {
-    const char* get_test_file() override { return __FILE__; }
-    const char* get_name() override { return "test_thread_custom_stack_size_failure"; }
-    int get_expected_failures() override { return 0; } \
-    seastar::future<> run_test_case() override;
+    using seastar::testing::seastar_test::seastar_test;
+    seastar::future<> run_test_case() const override;
 };
 
-static test_thread_custom_stack_size_failure test_thread_custom_stack_size_failure_instance;
+static test_thread_custom_stack_size_failure test_thread_custom_stack_size_failure_instance(
+    "test_thread_custom_stack_size_failure",
+    __FILE__, __LINE__);
 static thread_local volatile bool stack_guard_bypassed = false;
 
 static int get_mprotect_flags(void* ctx) {
@@ -200,7 +201,7 @@ static void* pagealign(void* ptr, size_t page_size) {
 static thread_local struct sigaction default_old_sigsegv_handler;
 
 static void bypass_stack_guard(int sig, siginfo_t* si, void* ctx) {
-    assert(sig == SIGSEGV);
+    SEASTAR_ASSERT(sig == SIGSEGV);
     int flags = get_mprotect_flags(ctx);
     stack_guard_bypassed = (flags & PROT_WRITE);
     if (!stack_guard_bypassed) {
@@ -208,12 +209,12 @@ static void bypass_stack_guard(int sig, siginfo_t* si, void* ctx) {
     }
     size_t page_size = getpagesize();
     auto mp_result = mprotect(pagealign(si->si_addr, page_size), page_size, PROT_READ | PROT_WRITE);
-    assert(mp_result == 0);
+    SEASTAR_ASSERT(mp_result == 0);
 }
 
 // This test will fail with a regular stack size, because we only probe
 // around 10KiB of data, and the stack guard resides after 128'th KiB.
-seastar::future<> test_thread_custom_stack_size_failure::run_test_case() {
+seastar::future<> test_thread_custom_stack_size_failure::run_test_case() const {
     if (RUNNING_ON_VALGRIND) {
         return make_ready_future<>();
     }

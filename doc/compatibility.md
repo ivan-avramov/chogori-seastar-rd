@@ -10,8 +10,8 @@ Link compatibility is not maintained - you cannot link an
 application built with one version of Seastar with another
 version of Seastar.
 
-Language dialects
-=================
+Language standards
+==================
 
 Seastar will support the last two standards approved by the
 ISO C++ committee. For example, after C++20 is released,
@@ -30,7 +30,7 @@ better for newer kernels.
 
 Filesystem implementation quality can have significant effect on
 file I/O performance. XFS is known to be working, ext4 may work well
-too. Test your filesystem and kernel versions to be sure. 
+too. Test your filesystem and kernel versions to be sure.
 
 Patches for new platforms (e.g, Windows) are welcome.
 
@@ -38,11 +38,11 @@ Patches for new platforms (e.g, Windows) are welcome.
 Compilers
 =========
 
-Seastar supports gcc and clang. Ports to other compilers are
+Seastar supports GCC and Clang. Ports to other compilers are
 welcome.
 
 The last two major releases of a compiler are supported (e.g.
-gcc 9 and gcc 10). Patches to support older versions are welcome,
+GCC 13 and GCC 14). Patches to support older versions are welcome,
 as long as they don't require onerous compromises.
 
 Deprecation
@@ -72,6 +72,8 @@ versions of the API. For example.
      server_socket::accept() API that returns a non-variadic
      future
    - Seastar_API_LEVEL=6 makes futures non-variadic
+   - Seastar_API_LEVEL=7 unifies CPU scheduling groups and IO priority classes
+     "while at it" file_impl API is forced to accept io_intent argument
 
 Applications can use an old API_LEVEL during a transition
 period, fix their code, and move to the new API_LEVEL.
@@ -107,8 +109,11 @@ API Level History
 |Level|Introduced |Mandatory|Description                                   |
 |:---:|:---------:|:-------:| -------------------------------------------- |
 | 2   |  2019-07  | 2020-04 | Non-variadic futures in socket::accept()     |
-| 3   |  2020-05  |         | make_file_data_sink() closes file and returns a future<>  |
-| 4   |  2020-06  |         | Non-variadic futures in when_all_succeed()   |
+| 3   |  2020-05  | 2023-03 | make_file_data_sink() closes file and returns a future<>  |
+| 4   |  2020-06  | 2023-03 | Non-variadic futures in when_all_succeed()   |
+| 5   |  2020-08  | 2023-03 | future::get() returns std::monostate() instead of void |
+| 6   |  2020-09  | 2023-03 | future<T> instead of future<T...>            |
+| 7   |  2023-05  | 2024-09 | unified CPU/IO scheduling groups             |
 
 
 Note: The "mandatory" column indicates when backwards compatibility

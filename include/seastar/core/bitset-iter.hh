@@ -13,8 +13,11 @@
 
 #pragma once
 
+#ifndef SEASTAR_MODULE
 #include <bitset>
 #include <limits>
+#include <seastar/util/modules.hh>
+#endif
 
 namespace seastar {
 
@@ -32,7 +35,7 @@ static constexpr int ulong_bits = std::numeric_limits<unsigned long>::digits;
  * which is returned when value == 1.
  */
 template<typename T>
-inline size_t count_leading_zeros(T value) noexcept;
+size_t count_leading_zeros(T value) noexcept;
 
 /**
  * Returns the number of trailing zeros in value's binary representation.
@@ -43,7 +46,7 @@ inline size_t count_leading_zeros(T value) noexcept;
  * The highest value that can be returned is std::numeric_limits<T>::digits - 1.
  */
 template<typename T>
-static inline size_t count_trailing_zeros(T value) noexcept;
+size_t count_trailing_zeros(T value) noexcept;
 
 template<>
 inline size_t count_leading_zeros<unsigned long>(unsigned long value) noexcept
@@ -102,7 +105,7 @@ size_t count_trailing_zeros<long long>(long long value) noexcept
  * Result is undefined if bitset.any() == false.
  */
 template<size_t N>
-static inline size_t get_first_set(const std::bitset<N>& bitset) noexcept
+inline size_t get_first_set(const std::bitset<N>& bitset) noexcept
 {
     static_assert(N <= ulong_bits, "bitset too large");
     return count_trailing_zeros(bitset.to_ulong());
@@ -113,14 +116,16 @@ static inline size_t get_first_set(const std::bitset<N>& bitset) noexcept
  * Result is undefined if bitset.any() == false.
  */
 template<size_t N>
-static inline size_t get_last_set(const std::bitset<N>& bitset) noexcept
+inline size_t get_last_set(const std::bitset<N>& bitset) noexcept
 {
     static_assert(N <= ulong_bits, "bitset too large");
     return ulong_bits - 1 - count_leading_zeros(bitset.to_ulong());
 }
 
+SEASTAR_MODULE_EXPORT_BEGIN
+
 template<size_t N>
-class set_iterator : public std::iterator<std::input_iterator_tag, int>
+class set_iterator
 {
 private:
     void advance() noexcept
@@ -134,6 +139,12 @@ private:
         }
     }
 public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = int;
+    using difference_type = std::ptrdiff_t;
+    using pointer = int*;
+    using reference = int&;
+
     set_iterator(std::bitset<N> bitset, int offset = 0) noexcept
         : _bitset(bitset)
         , _index(offset - 1)
@@ -143,9 +154,17 @@ public:
         advance();
     }
 
-    void operator++() noexcept
+    set_iterator& operator++() noexcept
     {
         advance();
+        return *this;
+    }
+
+    set_iterator operator++(int) noexcept
+    {
+        auto ret = *this;
+        advance();
+        return ret;
     }
 
     int operator*() const noexcept
@@ -174,7 +193,7 @@ public:
     using iterator = set_iterator<N>;
     using value_type = int;
 
-    set_range(std::bitset<N> bitset, int offset = 0) noexcept
+    constexpr set_range(std::bitset<N> bitset, int offset = 0) noexcept
         : _bitset(bitset)
         , _offset(offset)
     {
@@ -188,10 +207,12 @@ private:
 };
 
 template<size_t N>
-static inline set_range<N> for_each_set(std::bitset<N> bitset, int offset = 0) noexcept
+inline set_range<N> for_each_set(std::bitset<N> bitset, int offset = 0) noexcept
 {
     return set_range<N>(bitset, offset);
 }
+
+SEASTAR_MODULE_EXPORT_END
 
 }
 

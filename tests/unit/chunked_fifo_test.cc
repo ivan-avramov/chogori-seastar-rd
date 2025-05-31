@@ -20,16 +20,31 @@
  */
 
 
+#include <boost/test/tools/old/interface.hpp>
 #define BOOST_TEST_MODULE core
 
-#include <boost/test/included/unit_test.hpp>
+#include <boost/test/tools/context.hpp>
+
+#include <boost/test/unit_test.hpp>
 #include <seastar/core/chunked_fifo.hh>
+#include <seastar/core/circular_buffer.hh>
 #include <stdlib.h>
 #include <chrono>
 #include <deque>
-#include <seastar/core/circular_buffer.hh>
+#include <iterator>
+#include <ranges>
+#if __has_include(<version>)
+#include <version>
+#endif
 
 using namespace seastar;
+
+static_assert(std::weakly_incrementable<chunked_fifo<int>::iterator>);
+static_assert(std::weakly_incrementable<chunked_fifo<int>::const_iterator>);
+static_assert(std::sentinel_for<chunked_fifo<int>::iterator, chunked_fifo<int>::iterator>);
+static_assert(std::sentinel_for<chunked_fifo<int>::const_iterator, chunked_fifo<int>::const_iterator>);
+
+static_assert(std::ranges::range<chunked_fifo<const int>>);
 
 BOOST_AUTO_TEST_CASE(chunked_fifo_small) {
     // Check all the methods of chunked_fifo but with a trivial type (int) and
@@ -86,6 +101,80 @@ BOOST_AUTO_TEST_CASE(chunked_fifo_fullchunk) {
     }
     BOOST_REQUIRE_EQUAL(fifo.size(), 0u);
     BOOST_REQUIRE_EQUAL(fifo.empty(), true);
+}
+
+struct trackable_totals {
+    size_t cons_called = 0, dtor_called = 0;
+    size_t mcons_called = 0, ccons_called = 0;
+};
+
+struct trackable {
+    trackable(trackable_totals& tracker) : _tracker{tracker} {
+        _tracker.cons_called++;
+    }
+
+    trackable(const trackable& rhs) : _tracker{rhs._tracker} {
+        _tracker.ccons_called++;
+    }
+
+    trackable(trackable&& rhs) : _tracker{rhs._tracker} {
+        _tracker.mcons_called++;
+    }
+
+    void operator=(const trackable&) = delete;
+    void operator=(trackable&&) = delete;
+
+    ~trackable() {
+        _tracker.dtor_called++;
+    }
+
+    trackable_totals& _tracker;
+};
+
+BOOST_AUTO_TEST_CASE(chunked_fifo_pop_n) {
+    trackable_totals ctor_calls;
+    constexpr size_t N = 4;
+    chunked_fifo<trackable, N / 2> fifo;
+
+    auto fill_and_reset = [&](size_t size) {
+        fifo.clear();
+        ctor_calls = {};
+        for (size_t i = 0; i < size; i++) {
+            // we add 2, remove 1 in order to stress the case where chunk::begin and end
+            // are outside the range [0, items_per_chunk], i.e., where proper use of mask()
+            // is required
+            fifo.emplace_back(ctor_calls);
+            fifo.emplace_back(ctor_calls);
+            fifo.pop_front_n(1);
+        }
+    };
+
+    for (size_t size : std::views::iota((size_t)0, 2 * N) ) {
+        for (size_t pop_count : std::views::iota((size_t)0, size + 1) ) {
+            BOOST_TEST_CONTEXT("size: " << size << ", pop_count: " << pop_count) {
+                fill_and_reset(size);
+
+                // note that we add 2 and delete 1 element for every element added in
+                // fill_and_reset so that affects the numbers below
+
+                BOOST_REQUIRE_EQUAL(fifo.size(), size);
+                BOOST_REQUIRE_EQUAL(ctor_calls.cons_called, size * 2);
+                BOOST_REQUIRE_EQUAL(ctor_calls.dtor_called, size);
+
+                fifo.pop_front_n(pop_count);
+
+                BOOST_REQUIRE_EQUAL(fifo.size(), size - pop_count);
+                BOOST_REQUIRE_EQUAL(ctor_calls.cons_called, size * 2);
+                BOOST_REQUIRE_EQUAL(ctor_calls.dtor_called, size + pop_count);
+
+                fifo.emplace_back(ctor_calls);
+
+                BOOST_REQUIRE_EQUAL(fifo.size(), size - pop_count + 1);
+                BOOST_REQUIRE_EQUAL(ctor_calls.cons_called, size * 2 + 1);
+                BOOST_REQUIRE_EQUAL(ctor_calls.dtor_called, size + pop_count);
+            }
+        }
+    }
 }
 
 BOOST_AUTO_TEST_CASE(chunked_fifo_big) {
@@ -155,6 +244,136 @@ BOOST_AUTO_TEST_CASE(chunked_fifo_constructor) {
     BOOST_REQUIRE_EQUAL(destructed, N);
 }
 
+BOOST_AUTO_TEST_CASE(chunked_fifo_copy_move_test) {
+    constexpr size_t N = 4;
+    using ftype = chunked_fifo<trackable, N / 2>;
+
+    trackable_totals calls;
+    ftype fifo1, fifo2;
+
+    auto fill = [&](size_t size, ftype& fifo) {
+        fifo.clear();
+        calls = {};
+        for (size_t i = 0; i < size; i++) {
+            fifo.emplace_back(calls);
+        }
+    };
+
+    BOOST_REQUIRE_EQUAL(calls.cons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.ccons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
+
+    fill(0, fifo1);
+
+    BOOST_REQUIRE_EQUAL(calls.cons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.ccons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
+
+    fill(5, fifo1);
+
+    BOOST_REQUIRE_EQUAL(calls.cons_called, 5);
+    BOOST_REQUIRE_EQUAL(calls.ccons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
+
+    {
+        auto fifox{fifo1}; // copy ctor
+
+        BOOST_REQUIRE_EQUAL(calls.cons_called, 5);
+        BOOST_REQUIRE_EQUAL(calls.ccons_called, 5);
+        BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+        BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
+    } 
+
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 5);
+    fifo1.clear();
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 10);
+
+    fill(5, fifo1);
+
+    {
+        // move ctor, no element ctors are called at all
+        auto fifox{std::move(fifo1)}; 
+
+        BOOST_REQUIRE_EQUAL(calls.cons_called, 5);
+        BOOST_REQUIRE_EQUAL(calls.ccons_called, 0);
+        BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+        BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
+    } 
+
+    fill(5, fifo1);
+
+    fifo2 = fifo1;
+
+    BOOST_REQUIRE_EQUAL(calls.cons_called, 5);
+    BOOST_REQUIRE_EQUAL(calls.ccons_called, 5);
+    BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
+
+    fifo1.clear();
+
+    BOOST_REQUIRE_EQUAL(calls.cons_called, 5);
+    BOOST_REQUIRE_EQUAL(calls.ccons_called, 5);
+    BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 5);
+
+    fifo2 = fifo1;
+
+    BOOST_REQUIRE_EQUAL(calls.cons_called, 5);
+    BOOST_REQUIRE_EQUAL(calls.ccons_called, 5);
+    BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 10);
+
+    fill(5, fifo1);
+
+    fifo2 = std::move(fifo1);
+
+    BOOST_REQUIRE_EQUAL(calls.cons_called, 5);
+    BOOST_REQUIRE_EQUAL(calls.ccons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 0);
+
+    fill(1, fifo1);
+    fill(2, fifo2);
+    calls = {};
+
+    fifo1 = fifo2;
+
+    BOOST_REQUIRE_EQUAL(calls.cons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.ccons_called, 2);
+    BOOST_REQUIRE_EQUAL(calls.mcons_called, 0);
+    BOOST_REQUIRE_EQUAL(calls.dtor_called, 1);
+}
+
+BOOST_AUTO_TEST_CASE(chunked_copy_ctor) {
+
+    using ftype = chunked_fifo<int, 1>;
+
+    ftype f1;
+    f1.push_back(1);
+
+    ftype f2;
+    f2.push_back(1);
+    f2.push_back(2);
+
+    {
+        ftype f0;
+        BOOST_REQUIRE(f0 == ftype{});
+    }
+
+    {
+        ftype f0{f1};
+        BOOST_CHECK(f0 == f1);
+    }
+
+    {
+        ftype f0{f2};
+        BOOST_CHECK(f0 == f2);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(chunked_fifo_construct_fail) {
     // Check that if we fail to construct the item pushed, the queue remains
     // empty.
@@ -208,6 +427,55 @@ BOOST_AUTO_TEST_CASE(chunked_fifo_construct_fail2) {
     fifo.pop_front();
     BOOST_REQUIRE_EQUAL(fifo.size(), 0u);
     BOOST_REQUIRE_EQUAL(fifo.empty(), true);
+}
+
+BOOST_AUTO_TEST_CASE(chunked_fifo_equals_op) {
+    chunked_fifo<int> empty, vec123;
+    vec123.push_back(1);
+    vec123.push_back(2);
+    vec123.push_back(3);
+    auto empty2 = vec123;
+    empty2.clear();
+
+    BOOST_CHECK(empty == empty);
+    BOOST_CHECK(empty == empty2);
+    BOOST_CHECK(empty != vec123);
+    BOOST_CHECK(vec123 == vec123);
+}
+
+BOOST_AUTO_TEST_CASE(chunked_fifo_copy) {
+    chunked_fifo<int> empty, vec123;
+    vec123.push_back(1);
+    vec123.push_back(2);
+    vec123.push_back(3);
+
+    auto empty_copy = empty;
+    BOOST_CHECK(empty_copy.empty());
+
+    auto vec123_copy = vec123;
+    BOOST_CHECK_EQUAL(vec123.size(), 3);
+    BOOST_CHECK(vec123_copy == vec123);
+}
+
+BOOST_AUTO_TEST_CASE(chunked_fifo_assignment) {
+    chunked_fifo<int> empty, vec123, vec;
+    vec123.push_back(1);
+    vec123.push_back(2);
+    vec123.push_back(3);
+
+    BOOST_CHECK(vec.empty());
+    vec = empty;
+    BOOST_CHECK(vec.empty());
+    vec = vec123;
+    BOOST_CHECK_EQUAL(vec.size(), 3);
+    BOOST_CHECK(vec == vec123);
+    vec = {};
+    BOOST_CHECK(vec.empty());
+
+    // move assignment
+    vec = std::move(vec123);
+    BOOST_CHECK_EQUAL(vec.size(), 3);
+    BOOST_CHECK(vec123.empty());
 }
 
 // Enable the following to run some benchmarks on different queue options
@@ -354,5 +622,25 @@ BOOST_AUTO_TEST_CASE(chunked_fifo_iterator) {
         fifo.pop_front();
         reference.pop_front();
         BOOST_REQUIRE(std::equal(fifo.begin(), fifo.end(), reference.begin(), reference.end()));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(chunked_fifo_const_iterator) {
+    constexpr auto items_per_chunk = 8;
+    auto fifo = chunked_fifo<int, items_per_chunk>{};
+    auto reference = std::deque<int>{};
+
+    BOOST_REQUIRE(fifo.cbegin() == fifo.cend());
+
+    for (int i = 0; i < items_per_chunk * 4; ++i) {
+        fifo.push_back(i);
+        reference.push_back(i);
+        BOOST_REQUIRE(std::equal(fifo.cbegin(), fifo.cend(), reference.cbegin(), reference.cend()));
+    }
+
+    for (int i = 0; i < items_per_chunk * 2; ++i) {
+        fifo.pop_front();
+        reference.pop_front();
+        BOOST_REQUIRE(std::equal(fifo.cbegin(), fifo.cend(), reference.cbegin(), reference.cend()));
     }
 }

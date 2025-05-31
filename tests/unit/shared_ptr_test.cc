@@ -22,7 +22,7 @@
 
 #define BOOST_TEST_MODULE core
 
-#include <boost/test/included/unit_test.hpp>
+#include <boost/test/unit_test.hpp>
 #include <set>
 #include <unordered_map>
 #include <seastar/core/sstring.hh>
@@ -55,9 +55,9 @@ BOOST_AUTO_TEST_CASE(explot_dynamic_cast_use_after_free_problem) {
     shared_ptr<A> p = ::make_shared<A>();
     {
         auto p2 = dynamic_pointer_cast<B>(p);
-        BOOST_ASSERT(!p2);
+        SEASTAR_ASSERT(!p2);
     }
-    BOOST_ASSERT(!A::destroyed);
+    SEASTAR_ASSERT(!A::destroyed);
 }
 
 class C : public enable_shared_from_this<C> {
@@ -201,4 +201,20 @@ BOOST_AUTO_TEST_CASE(test_release) {
 BOOST_AUTO_TEST_CASE(test_const_release) {
     do_test_release<const A>();
     do_test_release<const A_esft>();
+}
+
+BOOST_AUTO_TEST_CASE(test_nullptr_compare) {
+    seastar::shared_ptr<int> ptr;
+    BOOST_REQUIRE(ptr == nullptr);
+    BOOST_REQUIRE(nullptr == ptr);
+    ptr = seastar::make_shared<int>(0);
+    BOOST_REQUIRE(ptr != nullptr);
+    BOOST_REQUIRE(nullptr != ptr);
+
+    seastar::lw_shared_ptr<int> lptr;
+    BOOST_REQUIRE(lptr == nullptr);
+    BOOST_REQUIRE(nullptr == lptr);
+    lptr = seastar::make_lw_shared<int>(0);
+    BOOST_REQUIRE(lptr != nullptr);
+    BOOST_REQUIRE(nullptr != lptr);
 }

@@ -21,14 +21,20 @@
 
 #pragma once
 
-#include <memory>
 #include <seastar/core/scheduling.hh>
 #include <seastar/util/backtrace.hh>
 
+#ifndef SEASTAR_MODULE
+#include <utility>
+#endif
+
 namespace seastar {
 
+SEASTAR_MODULE_EXPORT
 class task {
+protected:
     scheduling_group _sg;
+private:
 #ifdef SEASTAR_TASK_BACKTRACE
     shared_backtrace _bt;
 #endif
@@ -38,6 +44,10 @@ protected:
     // run_and_dispose() should be declared final to avoid losing concrete type
     // information via inheritance.
     ~task() = default;
+
+    scheduling_group set_scheduling_group(scheduling_group new_sg) noexcept{
+        return std::exchange(_sg, new_sg);
+    }
 public:
     explicit task(scheduling_group sg = current_scheduling_group()) noexcept : _sg(sg) {}
     virtual void run_and_dispose() noexcept = 0;
@@ -61,7 +71,11 @@ shared_backtrace task::get_backtrace() const {
 #endif
 }
 
+SEASTAR_MODULE_EXPORT_BEGIN
+
 void schedule(task* t) noexcept;
+void schedule_checked(task* t) noexcept;
 void schedule_urgent(task* t) noexcept;
 
+SEASTAR_MODULE_EXPORT_END
 }

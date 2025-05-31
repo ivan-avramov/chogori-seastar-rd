@@ -19,11 +19,32 @@
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <atomic>
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <queue>
+#include <string>
+#include <vector>
+#include <fcntl.h>
+#include <seastar/net/virtio-interface.hh>
+#include <linux/vhost.h>
+#include <linux/if_tun.h>
+#include <net/if.h>
+#include <seastar/util/assert.hh>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/net/virtio.hh>
 #include <seastar/core/posix.hh>
 #include <seastar/core/internal/pollable_fd.hh>
+#include <seastar/core/internal/poll.hh>
 #include "core/vla.hh"
-#include <seastar/net/virtio-interface.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/stream.hh>
 #include <seastar/core/circular_buffer.hh>
@@ -31,18 +52,9 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/util/function_input_iterator.hh>
 #include <seastar/util/transform_iterator.hh>
-#include <atomic>
-#include <vector>
-#include <queue>
-#include <fcntl.h>
-#include <linux/vhost.h>
-#include <linux/if_tun.h>
 #include <seastar/net/ip.hh>
 #include <seastar/net/const.hh>
 #include <seastar/net/native-stack.hh>
-
-#ifdef HAVE_OSV
-#include <osv/virtio-assign.hh>
 #endif
 
 namespace seastar {
@@ -53,34 +65,23 @@ namespace virtio {
 
 using phys = uint64_t;
 
-#ifndef HAVE_OSV
-
 phys virt_to_phys(void* p) {
     return reinterpret_cast<uintptr_t>(p);
 }
 
-#else
-
-phys virt_to_phys(void* p) {
-    return osv::assigned_virtio::virt_to_phys(p);
-}
-
-#endif
-
 class device : public net::device {
 private:
-    boost::program_options::variables_map _opts;
     net::hw_features _hw_features;
     uint64_t _features;
 
 private:
-    uint64_t setup_features() {
+    uint64_t setup_features(const net::virtio_options& opts, const program_options::value<std::string>& lro) {
         int64_t seastar_supported_features = VIRTIO_RING_F_INDIRECT_DESC | VIRTIO_NET_F_MRG_RXBUF;
 
-        if (!(_opts.count("event-index") && _opts["event-index"].as<std::string>() == "off")) {
+        if (!(opts.event_index && opts.event_index.get_value() == "off")) {
             seastar_supported_features |= VIRTIO_RING_F_EVENT_IDX;
         }
-        if (!(_opts.count("csum-offload") && _opts["csum-offload"].as<std::string>() == "off")) {
+        if (!(opts.csum_offload && opts.csum_offload.get_value() == "off")) {
             seastar_supported_features |= VIRTIO_NET_F_CSUM | VIRTIO_NET_F_GUEST_CSUM;
             _hw_features.tx_csum_l4_offload = true;
             _hw_features.rx_csum_offload = true;
@@ -88,21 +89,21 @@ private:
             _hw_features.tx_csum_l4_offload = false;
             _hw_features.rx_csum_offload = false;
         }
-        if (!(_opts.count("tso") && _opts["tso"].as<std::string>() == "off")) {
+        if (!(opts.tso && opts.tso.get_value() == "off")) {
             seastar_supported_features |= VIRTIO_NET_F_HOST_TSO4;
             _hw_features.tx_tso = true;
         } else {
             _hw_features.tx_tso = false;
         }
 
-        if (!(_opts.count("lro") && _opts["lro"].as<std::string>() == "off")) {
+        if (!(lro && lro.get_value() == "off")) {
             seastar_supported_features |= VIRTIO_NET_F_GUEST_TSO4;
             _hw_features.rx_lro = true;
         } else {
             _hw_features.rx_lro = false;
         }
 
-        if (!(_opts.count("ufo") && _opts["ufo"].as<std::string>() == "off")) {
+        if (!(opts.ufo && opts.ufo.get_value() == "off")) {
             seastar_supported_features |= VIRTIO_NET_F_HOST_UFO;
             seastar_supported_features |= VIRTIO_NET_F_GUEST_UFO;
             _hw_features.tx_ufo = true;
@@ -115,8 +116,8 @@ private:
     }
 
 public:
-    device(boost::program_options::variables_map opts)
-       : _opts(opts), _features(setup_features())
+    device(const virtio_options& opts, const program_options::value<std::string>& lro)
+       : _features(setup_features(opts, lro))
        {}
     ethernet_address hw_address() override {
         return { 0x12, 0x23, 0x34, 0x56, 0x67, 0x78 };
@@ -130,7 +131,7 @@ public:
         return _features;
     }
 
-    virtual std::unique_ptr<net::qp> init_local_queue(boost::program_options::variables_map opts, uint16_t qid) override;
+    virtual std::unique_ptr<net::qp> init_local_queue(const program_options::option_group& opts, uint16_t qid) override;
 };
 
 /* The virtio_notifier class determines how to do host-to-guest and guest-to-
@@ -164,22 +165,6 @@ public:
         : _kick(std::move(kick)) {}
 };
 
-#ifdef HAVE_OSV
-class notifier_osv : public notifier {
-private:
-    uint16_t _q_index;
-    osv::assigned_virtio &_virtio;
-public:
-    virtual void notify() override {
-        _virtio.kick(_q_index);
-    }
-    notifier_osv(osv::assigned_virtio &virtio, uint16_t q_index)
-        : _q_index(q_index)
-        , _virtio(virtio)
-    {
-    }
-};
-#endif
 
 struct ring_config {
     char* descs;
@@ -373,7 +358,7 @@ template <typename BufferChain, typename Completion>
 inline
 unsigned
 vring<BufferChain, Completion>::allocate_desc() {
-    assert(_free_head != -1);
+    SEASTAR_ASSERT(_free_head != -1);
     auto desc = _free_head;
     if (desc == _free_last) {
         _free_last = _free_head = -1;
@@ -606,7 +591,7 @@ qp::txq::post(circular_buffer<packet>& pb) {
 
         pb.pop_front();
         // Handle TCP checksum offload
-        auto oi = p.offload_info();
+        auto oi = p.get_offload_info();
         if (_dev._dev->hw_features().tx_csum_l4_offload) {
             auto eth_hdr_len = sizeof(eth_hdr);
             auto ip_hdr_len = oi.ip_hdr_len;
@@ -646,7 +631,7 @@ qp::txq::post(circular_buffer<packet>& pb) {
         packet q = packet(fragment{reinterpret_cast<char*>(&vhdr), _dev._header_len},
                 std::move(p));
         auto fut = _ring.available_descriptors().wait(q.nr_frags());
-        assert(fut.available()); // how it cannot?
+        SEASTAR_ASSERT(fut.available()); // how it cannot?
         _packets.emplace_back(packet_as_buffer_chain{ std::move(q) });
     }
     _ring.post(_packets.begin(), _packets.end());
@@ -710,7 +695,7 @@ qp::rxq::complete_buffer(single_buffer&& bc, size_t len) {
     // First buffer
     if (_remaining_buffers == 0) {
         auto hdr = reinterpret_cast<net_hdr_mrg*>(frag_buf);
-        assert(hdr->num_buffers >= 1);
+        SEASTAR_ASSERT(hdr->num_buffers >= 1);
         _remaining_buffers = hdr->num_buffers;
         frag_buf += _dev._header_len;
         frag_len -= _dev._header_len;
@@ -749,7 +734,7 @@ qp::rxq::complete_buffer(single_buffer&& bc, size_t len) {
 static std::unique_ptr<char[], free_deleter> virtio_buffer(size_t size) {
     void* ret;
     auto r = posix_memalign(&ret, 4096, size);
-    assert(r == 0);
+    SEASTAR_ASSERT(r == 0);
     bzero(ret, size);
     return std::unique_ptr<char[], free_deleter>(reinterpret_cast<char*>(ret));
 }
@@ -808,22 +793,22 @@ private:
     // this driver, as as soon as we close it, vhost stops servicing us.
     file_desc _vhost_fd;
 public:
-    qp_vhost(device* dev, boost::program_options::variables_map opts);
+    qp_vhost(device* dev, const native_stack_options& opts);
 };
 
-static size_t config_ring_size(boost::program_options::variables_map &opts) {
-    if (opts.count("event-index")) {
-        return opts["virtio-ring-size"].as<unsigned>();
+static size_t config_ring_size(const virtio_options& opts) {
+    if (opts.event_index) {
+        return opts.virtio_ring_size.get_value();
     } else {
         return 256;
     }
 }
 
-qp_vhost::qp_vhost(device *dev, boost::program_options::variables_map opts)
-    : qp(dev, config_ring_size(opts), config_ring_size(opts))
+qp_vhost::qp_vhost(device *dev, const native_stack_options& opts)
+    : qp(dev, config_ring_size(opts.virtio_opts), config_ring_size(opts.virtio_opts))
     , _vhost_fd(file_desc::open("/dev/vhost-net", O_RDWR))
 {
-    auto tap_device = opts["tap-device"].as<std::string>();
+    auto tap_device = opts.tap_device.get_value();
     int64_t vhost_supported_features;
     _vhost_fd.ioctl(VHOST_GET_FEATURES, vhost_supported_features);
     vhost_supported_features &= _dev->features();
@@ -840,7 +825,7 @@ qp_vhost::qp_vhost(device *dev, boost::program_options::variables_map opts)
     // this fd to VHOST_NET_SET_BACKEND, the Linux kernel keeps the reference
     // to it and it's fine to close the file descriptor.
     file_desc tap_fd(file_desc::open("/dev/net/tun", O_RDWR | O_NONBLOCK));
-    assert(tap_device.size() + 1 <= IFNAMSIZ);
+    SEASTAR_ASSERT(tap_device.size() + 1 <= IFNAMSIZ);
     ifreq ifr = {};
     ifr.ifr_flags = IFF_TAP | IFF_NO_PI | IFF_ONE_QUEUE | IFF_VNET_HDR;
     strcpy(ifr.ifr_ifrn.ifrn_name, tap_device.c_str());
@@ -899,133 +884,41 @@ qp_vhost::qp_vhost(device *dev, boost::program_options::variables_map opts)
     _vhost_fd.ioctl(VHOST_NET_SET_BACKEND, vhost_vring_file{1, tap_fd.get()});
 }
 
-#ifdef HAVE_OSV
-class qp_osv : public qp {
-private:
-    ethernet_address _mac;
-    osv::assigned_virtio &_virtio;
-public:
-    qp_osv(device *dev, osv::assigned_virtio &virtio,
-            boost::program_options::variables_map opts);
-};
-
-qp_osv::qp_osv(device *dev, osv::assigned_virtio &virtio,
-        boost::program_options::variables_map opts)
-        : qp(dev, virtio.queue_size(0), virtio.queue_size(1))
-        , _virtio(virtio)
-{
-    // Read the host's virtio supported feature bitmask, AND it with the
-    // features we want to use, and tell the host of the result:
-    uint32_t subset = _virtio.init_features(_dev->features());
-    if (subset & VIRTIO_NET_F_MRG_RXBUF) {
-        _header_len = sizeof(net_hdr_mrg);
-    } else {
-        _header_len = sizeof(net_hdr);
-    }
-
-    // TODO: save bits from "subset" in _hw_features?
-//    bool _mergeable_bufs = subset & VIRTIO_NET_F_MRG_RXBUF;
-//    bool _status = subset & VIRTIO_NET_F_STATUS;
-//    bool _tso_ecn = subset & VIRTIO_NET_F_GUEST_ECN;
-//    bool _host_tso_ecn = subset & VIRTIO_NET_F_HOST_ECN;
-//    bool _csum = subset & VIRTIO_NET_F_CSUM;
-//    bool _guest_csum = subset & VIRTIO_NET_F_GUEST_CSUM;
-//    bool _guest_tso4 = subset & VIRTIO_NET_F_GUEST_TSO4;
-//    bool _host_tso4 = subset & VIRTIO_NET_F_HOST_TSO4;
-//    bool _guest_ufo = subset & VIRTIO_NET_F_GUEST_UFO;
-
-    // Get the MAC address set by the host
-    assert(subset & VIRTIO_NET_F_MAC);
-    struct net_config {
-        /* The ring_config defining mac address (if VIRTIO_NET_F_MAC) */
-        uint8_t mac[6];
-        /* See VIRTIO_NET_F_STATUS and VIRTIO_NET_S_* */
-        uint16_t status;
-        /* Maximum number of each of transmit and receive queues;
-         * see VIRTIO_NET_F_MQ and VIRTIO_NET_CTRL_MQ.
-         * Legal values are between 1 and 0x8000
-         */
-        uint16_t max_virtqueue_pairs;
-    } __attribute__((packed)) host_config;
-    _virtio.conf_read(&host_config, sizeof(host_config));
-    _mac = { host_config.mac[0], host_config.mac[1], host_config.mac[2],
-             host_config.mac[3], host_config.mac[4], host_config.mac[5] };
-
-    // Setup notifiers
-    _rxq.set_notifier(std::make_unique<notifier_osv>(_virtio, 0));
-    _txq.set_notifier(std::make_unique<notifier_osv>(_virtio, 1));
-
-
-    // Tell the host where we put the rings (we already allocated them earlier)
-    _virtio.set_queue_pfn(
-            0, virt_to_phys(_rxq.getconfig().descs));
-    _virtio.set_queue_pfn(
-            1, virt_to_phys(_txq.getconfig().descs));
-
-    // Set up interrupts
-    // FIXME: in OSv, the first thing we do in the handler is to call
-    // _rqx.disable_interrupts(). Here in seastar, we only do it much later
-    // in the main engine(). Probably needs to do it like in osv - in the beginning of the handler.
-    _virtio.enable_interrupt(
-            0, [&] { _rxq.wake_notifier_wait(); } );
-    _virtio.enable_interrupt(
-            1, [&] { _txq.wake_notifier_wait(); } );
-
-    _virtio.set_driver_ok();
-}
-#endif
-
-std::unique_ptr<net::qp> device::init_local_queue(boost::program_options::variables_map opts, uint16_t qid) {
+std::unique_ptr<net::qp> device::init_local_queue(const program_options::option_group& opts, uint16_t qid) {
     static bool called = false;
-    assert(!qid);
-    assert(!called);
+    SEASTAR_ASSERT(!qid);
+    SEASTAR_ASSERT(!called);
     called = true;
 
-#ifdef HAVE_OSV
-    if (osv::assigned_virtio::get && osv::assigned_virtio::get()) {
-        std::cout << "In OSv and assigned host's virtio device\n";
-        return std::make_unique<qp_osv>(this, *osv::assigned_virtio::get(), opts);
-    }
-#endif
-    return std::make_unique<qp_vhost>(this, opts);
+    auto net_opts = dynamic_cast<const net::native_stack_options*>(&opts);
+    SEASTAR_ASSERT(net_opts);
+    return std::make_unique<qp_vhost>(this, *net_opts);
 }
 
 }
 
-boost::program_options::options_description
-get_virtio_net_options_description()
-{
-    boost::program_options::options_description opts(
-            "Virtio net options");
-    opts.add_options()
-        ("event-index",
-                boost::program_options::value<std::string>()->default_value("on"),
+net::virtio_options::virtio_options(program_options::option_group* parent_group)
+    : program_options::option_group(parent_group, "Virtio net options")
+    , event_index(*this, "event-index",
+                "on",
                 "Enable event-index feature (on / off)")
-        ("csum-offload",
-                boost::program_options::value<std::string>()->default_value("on"),
+    , csum_offload(*this, "csum-offload",
+                "on",
                 "Enable checksum offload feature (on / off)")
-        ("tso",
-                boost::program_options::value<std::string>()->default_value("on"),
+    , tso(*this, "tso",
+                "on",
                 "Enable TCP segment offload feature (on / off)")
-        ("ufo",
-                boost::program_options::value<std::string>()->default_value("on"),
+    , ufo(*this, "ufo",
+                "on",
                 "Enable UDP fragmentation offload feature (on / off)")
-        ("virtio-ring-size",
-                boost::program_options::value<unsigned>()->default_value(256),
+    , virtio_ring_size(*this, "virtio-ring-size",
+                256,
                 "Virtio ring size (must be power-of-two)")
-        ;
-    return opts;
+{
 }
 
-std::unique_ptr<net::device> create_virtio_net_device(boost::program_options::variables_map opts) {
-    return std::make_unique<virtio::device>(opts);
+std::unique_ptr<net::device> create_virtio_net_device(const virtio_options& opts, const program_options::value<std::string>& lro) {
+    return std::make_unique<virtio::device>(opts, lro);
 }
 
 }
-
-// Locks the shared object in memory and forces on-load function resolution.
-// Needed if the function passed to enable_interrupt() is run at interrupt
-// time.
-// TODO: Instead of doing this, _virtio.enable_interrupt() could take a
-// pollable to wake instead of a function, then this won't be needed.
-asm(".pushsection .note.osv-mlock, \"a\"; .long 0, 0, 0; .popsection");

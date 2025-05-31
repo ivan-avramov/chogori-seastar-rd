@@ -19,6 +19,28 @@
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
 
+#ifdef SEASTAR_MODULE
+module;
+#endif
+
+#include <chrono>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <queue>
+
+#include <seastar/util/assert.hh>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+#ifdef SEASTAR_MODULE
+module seastar;
+#else
 #include <seastar/net/native-stack.hh>
 #include "net/native-stack-impl.hh"
 #include <seastar/net/net.hh>
@@ -32,16 +54,7 @@
 #include <seastar/net/dhcp.hh>
 #include <seastar/net/config.hh>
 #include <seastar/core/reactor.hh>
-#include <memory>
-#include <queue>
-#include <fstream>
-#ifdef HAVE_OSV
-#include <osv/firmware.hh>
-#include <gnu/libc-version.h>
 #endif
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace seastar {
 
@@ -49,19 +62,19 @@ namespace net {
 
 using namespace seastar;
 
-void create_native_net_device(boost::program_options::variables_map opts) {
+void create_native_net_device(const native_stack_options& opts) {
 
     bool deprecated_config_used = true;
 
     std::stringstream net_config;
 
-    if ( opts.count("net-config")) {
+    if ( opts.net_config) {
         deprecated_config_used = false;
-        net_config << opts["net-config"].as<std::string>();             
+        net_config << opts.net_config.get_value();
     }
-    if ( opts.count("net-config-file")) {
+    if ( opts.net_config_file) {
         deprecated_config_used = false;
-        std::fstream fs(opts["net-config-file"].as<std::string>());
+        std::fstream fs(opts.net_config_file.get_value());
         net_config << fs.rdbuf();
     }
 
@@ -69,13 +82,13 @@ void create_native_net_device(boost::program_options::variables_map opts) {
 
     if ( deprecated_config_used) {
 #ifdef SEASTAR_HAVE_DPDK
-        if ( opts.count("dpdk-pmd")) {
-             dev = create_dpdk_net_device(opts["dpdk-port-index"].as<unsigned>(), smp::count,
-                !(opts.count("lro") && opts["lro"].as<std::string>() == "off"),
-                !(opts.count("hw-fc") && opts["hw-fc"].as<std::string>() == "off"));   
-       } else 
-#endif  
-        dev = create_virtio_net_device(opts);
+        if ( opts.dpdk_pmd) {
+             dev = create_dpdk_net_device(opts.dpdk_opts.dpdk_port_index.get_value(), smp::count,
+                !(opts.lro && opts.lro.get_value() == "off"),
+                !(opts.dpdk_opts.hw_fc && opts.dpdk_opts.hw_fc.get_value() == "off"));
+       } else
+#endif
+        dev = create_virtio_net_device(opts.virtio_opts, opts.lro);
     }
     else {
         auto device_configs = parse_config(net_config);
@@ -85,15 +98,15 @@ void create_native_net_device(boost::program_options::variables_map opts) {
         }
 
         for ( auto&& device_config : device_configs) {
-            auto& hw_config = device_config.second.hw_cfg;   
+            auto& hw_config = device_config.second.hw_cfg;
 #ifdef SEASTAR_HAVE_DPDK
             if ( hw_config.port_index || !hw_config.pci_address.empty() ) {
 	            dev = create_dpdk_net_device(hw_config);
-	        } else 
-#endif  
+	        } else
+#endif
             {
-                (void)hw_config;        
-                std::runtime_error("only DPDK supports new configuration format"); 
+                (void)hw_config;
+                std::runtime_error("only DPDK supports new configuration format");
             }
         }
     }
@@ -104,7 +117,7 @@ void create_native_net_device(boost::program_options::variables_map opts) {
     // signal when done.
     // FIXME: handle exceptions
     for (unsigned i = 0; i < smp::count; i++) {
-        (void)smp::submit_to(i, [opts, sdev] {
+        (void)smp::submit_to(i, [&opts, sdev] {
             uint16_t qid = this_shard_id();
             if (qid < sdev->hw_queues_count()) {
                 auto qp = sdev->init_local_queue(opts, qid);
@@ -112,7 +125,7 @@ void create_native_net_device(boost::program_options::variables_map opts) {
                 for (unsigned i = sdev->hw_queues_count() + qid % sdev->hw_queues_count(); i < smp::count; i+= sdev->hw_queues_count()) {
                     cpu_weights[i] = 1;
                 }
-                cpu_weights[qid] = opts["hw-queue-weight"].as<float>();
+                cpu_weights[qid] = opts.hw_queue_weight.get_value();
                 qp->configure_proxies(cpu_weights);
                 sdev->set_local_queue(std::move(qp));
             } else {
@@ -126,12 +139,12 @@ void create_native_net_device(boost::program_options::variables_map opts) {
     // wait for all shards to set their local queue,
     // then when link is ready, communicate the native_stack to the caller
     // via `create_native_stack` (that sets the ready_promise value)
-    (void)sem->wait(smp::count).then([opts, sdev] {
+    (void)sem->wait(smp::count).then([&opts, sdev] {
         // FIXME: future is discarded
-        (void)sdev->link_ready().then([opts, sdev] {
+        (void)sdev->link_ready().then([&opts, sdev] {
             for (unsigned i = 0; i < smp::count; i++) {
                 // FIXME: future is discarded
-                (void)smp::submit_to(i, [opts, sdev] {
+                (void)smp::submit_to(i, [&opts, sdev] {
                     create_native_stack(opts, sdev);
                 });
             }
@@ -157,14 +170,18 @@ private:
     }
     using tcp4 = tcp<ipv4_traits>;
 public:
-    explicit native_network_stack(boost::program_options::variables_map opts, std::shared_ptr<device> dev);
+    explicit native_network_stack(const native_stack_options& opts, std::shared_ptr<device> dev);
     virtual server_socket listen(socket_address sa, listen_options opt) override;
     virtual ::seastar::socket socket() override;
     virtual udp_channel make_udp_channel(const socket_address& addr) override;
+    virtual net::datagram_channel make_unbound_datagram_channel(sa_family_t) override;
+    virtual net::datagram_channel make_bound_datagram_channel(const socket_address& local) override;
     virtual future<> initialize() override;
-    static future<std::unique_ptr<network_stack>> create(boost::program_options::variables_map opts) {
+    static future<std::unique_ptr<network_stack>> create(const program_options::option_group& opts) {
+        auto ns_opts = dynamic_cast<const native_stack_options*>(&opts);
+        SEASTAR_ASSERT(ns_opts);
         if (this_shard_id() == 0) {
-            create_native_net_device(opts);
+            create_native_net_device(*ns_opts);
         }
         return ready_promise.get_future();
     }
@@ -178,6 +195,18 @@ public:
     friend class native_network_interface;
 
     std::vector<network_interface> network_interfaces() override;
+
+    virtual statistics stats(unsigned scheduling_group_id) override {
+        return statistics{
+            internal::native_stack_net_stats::bytes_sent[scheduling_group_id],
+            internal::native_stack_net_stats::bytes_received[scheduling_group_id],
+        };
+    }
+
+    virtual void clear_stats(unsigned scheduling_group_id) override {
+        internal::native_stack_net_stats::bytes_sent[scheduling_group_id] = 0;
+        internal::native_stack_net_stats::bytes_received[scheduling_group_id] = 0;
+    }
 };
 
 thread_local promise<std::unique_ptr<network_stack>> native_network_stack::ready_promise;
@@ -187,31 +216,35 @@ native_network_stack::make_udp_channel(const socket_address& addr) {
     return _inet.get_udp().make_channel(addr);
 }
 
-void
-add_native_net_options_description(boost::program_options::options_description &opts) {
-    opts.add(get_virtio_net_options_description());
-#ifdef SEASTAR_HAVE_DPDK
-    opts.add(get_dpdk_net_options_description());
-#endif
+net::datagram_channel native_network_stack::make_unbound_datagram_channel(sa_family_t family) {
+    if (family != AF_INET) {
+        throw std::runtime_error("Unsupported address family");
+    }
+
+    return _inet.get_udp().make_channel({});
 }
 
-native_network_stack::native_network_stack(boost::program_options::variables_map opts, std::shared_ptr<device> dev)
+net::datagram_channel native_network_stack::make_bound_datagram_channel(const socket_address& local) {
+    return _inet.get_udp().make_channel(local);
+}
+
+native_network_stack::native_network_stack(const native_stack_options& opts, std::shared_ptr<device> dev)
     : _netif(std::move(dev))
     , _inet(&_netif) {
-    _inet.get_udp().set_queue_size(opts["udpv4-queue-size"].as<int>());
-    _dhcp = opts["host-ipv4-addr"].defaulted()
-            && opts["gw-ipv4-addr"].defaulted()
-            && opts["netmask-ipv4-addr"].defaulted() && opts["dhcp"].as<bool>();
+    _inet.get_udp().set_queue_size(opts.udpv4_queue_size.get_value());
+    _dhcp = opts.host_ipv4_addr.defaulted()
+            && opts.gw_ipv4_addr.defaulted()
+            && opts.netmask_ipv4_addr.defaulted() && opts.dhcp.get_value();
     if (!_dhcp) {
-        _inet.set_host_address(ipv4_address(_dhcp ? 0 : opts["host-ipv4-addr"].as<std::string>()));
-        _inet.set_gw_address(ipv4_address(opts["gw-ipv4-addr"].as<std::string>()));
-        _inet.set_netmask_address(ipv4_address(opts["netmask-ipv4-addr"].as<std::string>()));
+        _inet.set_host_address(ipv4_address(opts.host_ipv4_addr.get_value()));
+        _inet.set_gw_address(ipv4_address(opts.gw_ipv4_addr.get_value()));
+        _inet.set_netmask_address(ipv4_address(opts.netmask_ipv4_addr.get_value()));
     }
 }
 
 server_socket
 native_network_stack::listen(socket_address sa, listen_options opts) {
-    assert(sa.family() == AF_INET || sa.is_unspecified());
+    SEASTAR_ASSERT(sa.family() == AF_INET || sa.is_unspecified());
     return tcpv4_listen(_inet.get_tcp(), ntohs(sa.as_posix_sockaddr_in().sin_port), opts);
 }
 
@@ -301,49 +334,51 @@ void arp_learn(ethernet_address l2, ipv4_address l3)
     });
 }
 
-void create_native_stack(boost::program_options::variables_map opts, std::shared_ptr<device> dev) {
+void create_native_stack(const native_stack_options& opts, std::shared_ptr<device> dev) {
     native_network_stack::ready_promise.set_value(std::unique_ptr<network_stack>(std::make_unique<native_network_stack>(opts, std::move(dev))));
 }
 
-boost::program_options::options_description nns_options() {
-    boost::program_options::options_description opts(
-            "Native networking stack options");
-    opts.add_options()
-        ("tap-device",
-                boost::program_options::value<std::string>()->default_value("tap0"),
+native_stack_options::native_stack_options()
+    : program_options::option_group(nullptr, "Native networking stack options")
+    // these two are ghost options
+    , net_config(*this, "net-config", program_options::unused{})
+    , net_config_file(*this, "net-config-file", program_options::unused{})
+    , tap_device(*this, "tap-device",
+                "tap0",
                 "tap device to connect to")
-        ("host-ipv4-addr",
-                boost::program_options::value<std::string>()->default_value("192.168.122.2"),
+    , host_ipv4_addr(*this, "host-ipv4-addr",
+                "192.168.122.2",
                 "static IPv4 address to use")
-        ("gw-ipv4-addr",
-                boost::program_options::value<std::string>()->default_value("192.168.122.1"),
+    , gw_ipv4_addr(*this, "gw-ipv4-addr",
+                "192.168.122.1",
                 "static IPv4 gateway to use")
-        ("netmask-ipv4-addr",
-                boost::program_options::value<std::string>()->default_value("255.255.255.0"),
+    , netmask_ipv4_addr(*this, "netmask-ipv4-addr",
+                "255.255.255.0",
                 "static IPv4 netmask to use")
-        ("udpv4-queue-size",
-                boost::program_options::value<int>()->default_value(ipv4_udp::default_queue_size),
+    , udpv4_queue_size(*this, "udpv4-queue-size",
+                ipv4_udp::default_queue_size,
                 "Default size of the UDPv4 per-channel packet queue")
-        ("dhcp",
-                boost::program_options::value<bool>()->default_value(true),
+    , dhcp(*this, "dhcp",
+                true,
                         "Use DHCP discovery")
-        ("hw-queue-weight",
-                boost::program_options::value<float>()->default_value(1.0f),
+    , hw_queue_weight(*this, "hw-queue-weight",
+                1.0f,
                 "Weighing of a hardware network queue relative to a software queue (0=no work, 1=equal share)")
 #ifdef SEASTAR_HAVE_DPDK
-        ("dpdk-pmd", "Use DPDK PMD drivers")
+    , dpdk_pmd(*this, "dpdk-pmd", "Use DPDK PMD drivers")
+#else
+    , dpdk_pmd(*this, "dpdk-pmd", program_options::unused{})
 #endif
-        ("lro",
-                boost::program_options::value<std::string>()->default_value("on"),
+    , lro(*this, "lro",
+                "on",
                 "Enable LRO")
-        ;
-
-    add_native_net_options_description(opts);
-    return opts;
+    , virtio_opts(this)
+    , dpdk_opts(this)
+{
 }
 
-void register_native_stack() {
-    register_network_stack("native", nns_options(), native_network_stack::create);
+network_stack_entry register_native_stack() {
+    return network_stack_entry{"native", std::make_unique<native_stack_options>(), native_network_stack::create, false};
 }
 
 class native_network_stack::native_network_interface : public net::network_interface_impl {
@@ -354,8 +389,10 @@ public:
     native_network_interface(const native_network_stack& stack)
         : _stack(stack)
         , _addresses(1, _stack._inet.host_address())
-        , _hardware_address(_stack._inet.netif()->hw_address().mac.begin(), _stack._inet.netif()->hw_address().mac.end())
-    {}
+    {
+        const auto mac = _stack._inet.netif()->hw_address().mac;
+        _hardware_address = std::vector<uint8_t>{mac.cbegin(), mac.cend()};
+    }
     native_network_interface(const native_network_interface&) = default;
 
     uint32_t index() const override {
@@ -372,13 +409,13 @@ public:
         return name();
     }
     const std::vector<net::inet_address>& addresses() const override {
-        return _addresses;            
+        return _addresses;
     }
     const std::vector<uint8_t> hardware_address() const override {
         return _hardware_address;
     }
     bool is_loopback() const override {
-        return false;   
+        return false;
     }
     bool is_virtual() const override {
         return false;
@@ -403,6 +440,6 @@ std::vector<network_interface> native_network_stack::network_interfaces() {
     return res;
 }
 
-}
+} // namespace net
 
 }

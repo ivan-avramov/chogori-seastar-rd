@@ -29,36 +29,40 @@ else
 fi
 
 debian_packages=(
-    git
-    ninja-build
-    ragel
+    cmake
+    diffutils
+    doxygen
+    g++
+    gcc
+    libboost-all-dev
+    libc-ares-dev
+    libcrypto++-dev
+    libfmt-dev
+    libgnutls28-dev
     libhwloc-dev
+    liblz4-dev
     libnuma-dev
     libpciaccess-dev
-    libcrypto++-dev
-    libboost-all-dev
-    libxml2-dev
-    xfslibs-dev
-    libgnutls28-dev
-    liblz4-dev
-    libsctp-dev
-    gcc
-    make
     libprotobuf-dev
-    protobuf-compiler
-    python3
-    systemtap-sdt-dev
+    libsctp-dev
     libtool
-    cmake
+    liburing-dev
+    libxml2-dev
     libyaml-cpp-dev
-    libc-ares-dev
-    stow
-    g++
-    diffutils
-    valgrind
-    doxygen
+    make
+    meson
+    ninja-build
     openssl
     pkg-config
+    protobuf-compiler
+    python3
+    python3-pyelftools
+    python3-yaml
+    ragel
+    stow
+    systemtap-sdt-dev
+    valgrind
+    xfslibs-dev
 )
 
 # seastar doesn't directly depend on these packages. They are
@@ -66,68 +70,91 @@ debian_packages=(
 # has no way of saying "static seastar, but dynamic transitive
 # dependencies". They provide the various .so -> .so.ver symbolic
 # links.
-transitive=(libtool-ltdl-devel trousers-devel libidn2-devel libunistring-devel)
+transitive=(
+    libidn2-devel
+    libtool-ltdl-devel
+    libunistring-devel
+    trousers-devel
+)
 
 redhat_packages=(
-    hwloc-devel
-    numactl-devel
-    libpciaccess-devel
-    cryptopp-devel
-    libxml2-devel
-    xfsprogs-devel
-    gnutls-devel
-    lksctp-tools-devel
-    lz4-devel
-    gcc
-    make
-    protobuf-devel
-    protobuf-compiler
-    python3
-    systemtap-sdt-devel
-    libtool
-    cmake
-    yaml-cpp-devel
+    boost-devel
     c-ares-devel
-    stow
+    cmake
     diffutils
     doxygen
+    fmt-devel
+    gcc
+    gnutls-devel
+    hwloc-devel
+    libpciaccess-devel
+    libtool
+    liburing-devel
+    libxml2-devel
+    lksctp-tools-devel
+    lz4-devel
+    make
+    meson
+    numactl-devel
     openssl
+    protobuf-compiler
+    protobuf-devel
+    python3
+    python3-pyelftools
+    python3-pyyaml
+    stow
+    systemtap-sdt-devel
+    valgrind-devel
+    xfsprogs-devel
+    yaml-cpp-devel
     "${transitive[@]}"
 )
 
 fedora_packages=(
     "${redhat_packages[@]}"
-    gcc-c++
-    ninja-build
-    ragel
     boost-devel
-    libubsan
+    fmt-devel
+    gcc-c++
     libasan
     libatomic
+    libubsan
+    ninja-build
+    ragel
     valgrind-devel
 )
 
 centos7_packages=(
     "${redhat_packages[@]}"
+    cmake3
+    devtoolset-11-gcc-c++
+    devtoolset-11-libasan
+    devtoolset-11-libatomic
+    devtoolset-11-libubsan
     ninja-build
     ragel
-    cmake3
     rh-mongodb36-boost-devel
-    devtoolset-9-gcc-c++
-    devtoolset-9-libubsan
-    devtoolset-9-libasan
-    devtoolset-9-libatomic
 )
 
 centos8_packages=(
     "${redhat_packages[@]}"
+    gcc-toolset-11-gcc
+    gcc-toolset-11-gcc-c++
+    gcc-toolset-11-libasan-devel
+    gcc-toolset-11-libatomic-devel
+    gcc-toolset-11-libubsan-devel
     ninja-build
     ragel
-    gcc-toolset-9-gcc
-    gcc-toolset-9-gcc-c++
-    gcc-toolset-9-libubsan-devel
-    gcc-toolset-9-libasan-devel
-    gcc-toolset-9-libatomic-devel
+)
+
+centos9_packages=(
+    "${redhat_packages[@]}"
+    gcc-toolset-13-gcc
+    gcc-toolset-13-gcc-c++
+    gcc-toolset-13-libasan-devel
+    gcc-toolset-13-libatomic-devel
+    gcc-toolset-13-libubsan-devel
+    ninja-build
+    ragel
 )
 
 # 1) glibc 2.30-3 has sys/sdt.h (systemtap include)
@@ -138,39 +165,50 @@ centos8_packages=(
 # 3) aur installations require having sudo and being
 #    a sudoer. makepkg does not work otherwise.
 arch_packages=(
-    gcc
-    ninja
-    ragel
     boost
     boost-libs
-    hwloc
-    numactl
-    libpciaccess
+    c-ares
+    cmake
     crypto++
-    libxml2
-    xfsprogs
+    filesystem
+    fmt
+    gcc
+    glibc
     gnutls
+    hwloc
+    libpciaccess
+    libtool
+    liburing
+    libxml2
     lksctp-tools
     lz4
     make
-    protobuf
-    libtool
-    cmake
-    yaml-cpp
-    stow
-    c-ares
-    pkgconf
-    python3
-    glibc
-    filesystem
-    valgrind
+    meson
+    ninja
+    numactl
     openssl
+    pkgconf
+    protobuf
+    python3
+    python-pyelftools
+    python-yaml
+    ragel
+    stow
+    valgrind
+    xfsprogs
+    yaml-cpp
 )
 
 opensuse_packages=(
     c-ares-devel
     cmake
     hwloc-devel
+    libboost_atomic1_66_0
+    libboost_atomic1_66_0-devel
+    libboost_chrono1_66_0
+    libboost_chrono1_66_0-devel
+    libboost_date_time1_66_0
+    libboost_date_time1_66_0-devel
     libboost_filesystem1_66_0
     libboost_filesystem1_66_0-devel
     libboost_program_options1_66_0
@@ -181,41 +219,40 @@ opensuse_packages=(
     libboost_test1_66_0-devel
     libboost_thread1_66_0
     libboost_thread1_66_0-devel
-    libcryptopp-devel
-    libboost_atomic1_66_0
-    libboost_atomic1_66_0-devel
-    libboost_date_time1_66_0
-    libboost_date_time1_66_0-devel
-    libboost_chrono1_66_0
-    libboost_chrono1_66_0-devel
     libgnutls-devel
     libgnutlsxx28
     liblz4-devel
     libnuma-devel
+    libtool
     lksctp-tools-devel
-    ninja protobuf-devel
+    meson
+    ninja
+    openssl
+    protobuf-devel
+    python3-PyYAML
     ragel
+    stow
     xfsprogs-devel
     yaml-cpp-devel
-    libtool
-    stow
-    openssl
 )
 
 case "$ID" in
-    ubuntu|debian)
+    ubuntu|debian|pop)
         apt-get install -y "${debian_packages[@]}"
     ;;
     fedora)
         dnf install -y "${fedora_packages[@]}"
     ;;
-    centos)
+    rhel|centos|rocky)
         if [ "$VERSION_ID" = "7" ]; then
             yum install -y epel-release centos-release-scl scl-utils
             yum install -y "${centos7_packages[@]}"
-        elif [ "$VERSION_ID" = "8" ]; then
+        elif [ "${VERSION_ID%%.*}" = "8" ]; then
             dnf install -y epel-release
             dnf install -y "${centos8_packages[@]}"
+        elif [ "${VERSION_ID%%.*}" = "9" ]; then
+            dnf install -y epel-release
+            dnf install -y "${centos9_packages[@]}"
         fi
     ;;
     opensuse-leap)
@@ -233,16 +270,3 @@ case "$ID" in
         exit 1
     ;;
 esac
-
-
-mkdir -p deps
-cd deps
-if [ ! -d "fmt" ]; then git clone https://github.com/fmtlib/fmt.git; fi
-
-cd fmt
-git checkout 11.2.0
-mkdir -p build
-cd build
-cmake ..
-make -j
-make install

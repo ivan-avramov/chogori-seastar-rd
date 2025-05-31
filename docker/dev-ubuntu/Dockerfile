@@ -8,6 +8,7 @@ RUN apt update && apt upgrade -y && apt install -y \
     cmake \
     curl \
     gdb \
+    git \
     valgrind \
     software-properties-common \
     vim \
@@ -22,6 +23,8 @@ RUN apt update && apt upgrade -y && apt install -y \
     rpm \
     scons \
     git \
+    iproute2 \
+    telnet \
     sed;
 
 VOLUME [ "/build" ]

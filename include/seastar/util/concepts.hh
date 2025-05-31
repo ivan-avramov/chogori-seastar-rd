@@ -20,15 +20,15 @@
  */
 #pragma once
 
-#if defined(__cpp_concepts) && __cpp_concepts >= 201907
+#include <concepts>
 
-#define SEASTAR_CONCEPT(x...) x
-#define SEASTAR_NO_CONCEPT(x...)
-
+#if defined(__cpp_concepts) && __cpp_concepts >= 201907 && \
+    defined(__cpp_lib_concepts) && __cpp_lib_concepts >= 201907
+    // good
 #else
-
-#define SEASTAR_CONCEPT(x...)
-#define SEASTAR_NO_CONCEPT(x...) x
-
+#error the language support and/or library support for concepts is missing
 #endif
 
+// provided for backward compatibility
+#define SEASTAR_CONCEPT(x...) x
+#define SEASTAR_NO_CONCEPT(x...)

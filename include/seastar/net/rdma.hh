@@ -32,6 +32,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/core/internal/poll.hh>
 
 #include <infiniband/verbs.h>
 

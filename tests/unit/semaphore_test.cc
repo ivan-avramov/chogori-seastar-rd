@@ -31,7 +31,10 @@
 #include <seastar/core/map_reduce.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/shared_mutex.hh>
-#include <boost/range/irange.hpp>
+#include <ranges>
+#include <stdexcept>
+
+#include "expected_exception.hh"
 
 using namespace seastar;
 using namespace std::chrono_literals;
@@ -150,9 +153,33 @@ SEASTAR_TEST_CASE(test_broken_semaphore) {
     });
 }
 
+SEASTAR_THREAD_TEST_CASE(test_default_broken_semaphore) {
+    struct test_semaphore_exception_factory {
+        static semaphore_timed_out timeout() noexcept { return semaphore_timed_out(); }
+    };
+    auto sem = basic_semaphore<test_semaphore_exception_factory>(0);
+    auto fut = sem.wait();
+    BOOST_REQUIRE(!fut.available());
+    sem.broken();
+    BOOST_REQUIRE_THROW(fut.get(), broken_semaphore);
+    BOOST_REQUIRE_THROW(sem.wait().get(), broken_semaphore);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_non_default_broken_semaphore) {
+    struct test_semaphore_exception_factory {
+        static semaphore_timed_out timeout() noexcept { return semaphore_timed_out(); }
+    };
+    auto sem = basic_semaphore<test_semaphore_exception_factory>(0);
+    auto fut = sem.wait();
+    BOOST_REQUIRE(!fut.available());
+    sem.broken(expected_exception());
+    BOOST_REQUIRE_THROW(fut.get(), expected_exception);
+    BOOST_REQUIRE_THROW(sem.wait().get(), expected_exception);
+}
+
 SEASTAR_TEST_CASE(test_shared_mutex_exclusive) {
     return do_with(shared_mutex(), unsigned(0), [] (shared_mutex& sm, unsigned& counter) {
-        return parallel_for_each(boost::irange(0, 10), [&sm, &counter] (int idx) {
+        return parallel_for_each(std::views::iota(0, 10), [&sm, &counter] (int idx) {
             return with_lock(sm, [&counter] {
                 BOOST_REQUIRE_EQUAL(counter, 0u);
                 ++counter;
@@ -177,7 +204,7 @@ SEASTAR_TEST_CASE(test_shared_mutex_shared) {
                 });
             });
         };
-        return map_reduce(boost::irange(0, 100), running_in_parallel, false, std::bit_or<bool>()).then([&counter] (bool result) {
+        return map_reduce(std::views::iota(0, 100), running_in_parallel, false, std::bit_or<bool>()).then([&counter] (bool result) {
             BOOST_REQUIRE_EQUAL(result, true);
             BOOST_REQUIRE_EQUAL(counter, 0u);
         });
@@ -214,7 +241,7 @@ SEASTAR_TEST_CASE(test_shared_mutex_mixed) {
                 return running_in_parallel(instance);
             }
         };
-        return map_reduce(boost::irange(0, 100), run, false, std::bit_or<bool>()).then([&counter] (bool result) {
+        return map_reduce(std::views::iota(0, 100), run, false, std::bit_or<bool>()).then([&counter] (bool result) {
             BOOST_REQUIRE_EQUAL(result, true);
             BOOST_REQUIRE_EQUAL(counter, 0u);
         });
@@ -239,9 +266,9 @@ SEASTAR_TEST_CASE(test_with_semaphore) {
     });
 }
 
-SEASTAR_THREAD_TEST_CASE(test_semaphore_units_splitting) {
+SEASTAR_THREAD_TEST_CASE(test_semaphore_units_valid_splitting) {
     auto sm = semaphore(2);
-    auto units = get_units(sm, 2, 1min).get0();
+    auto units = get_units(sm, 2, 1min).get();
     {
         BOOST_REQUIRE_EQUAL(units.count(), 2);
         BOOST_REQUIRE_EQUAL(sm.available_units(), 0);
@@ -249,31 +276,111 @@ SEASTAR_THREAD_TEST_CASE(test_semaphore_units_splitting) {
         BOOST_REQUIRE_EQUAL(sm.available_units(), 0);
     }
     BOOST_REQUIRE_EQUAL(sm.available_units(), 1);
-    units.~semaphore_units();
-    units = get_units(sm, 2, 1min).get0();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_semaphore_units_invalid_splitting) {
+    auto sm = semaphore(2);
+    auto units = get_units(sm, 2, 1min).get();
     BOOST_REQUIRE_EQUAL(sm.available_units(), 0);
     BOOST_REQUIRE_THROW(units.split(10), std::invalid_argument);
     BOOST_REQUIRE_EQUAL(sm.available_units(), 0);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_semaphore_units_return) {
+SEASTAR_THREAD_TEST_CASE(test_semaphore_units_return_when_destroyed) {
     auto sm = semaphore(3);
-    auto units = get_units(sm, 3, 1min).get0();
+  {
+    auto units = get_units(sm, 3, 1min).get();
     BOOST_REQUIRE_EQUAL(units.count(), 3);
     BOOST_REQUIRE_EQUAL(sm.available_units(), 0);
     BOOST_REQUIRE_EQUAL(units.return_units(1), 2);
     BOOST_REQUIRE_EQUAL(units.count(), 2);
     BOOST_REQUIRE_EQUAL(sm.available_units(), 1);
-    units.~semaphore_units();
+  }
     BOOST_REQUIRE_EQUAL(sm.available_units(), 3);
+}
 
-    units = get_units(sm, 2, 1min).get0();
+SEASTAR_THREAD_TEST_CASE(test_semaphore_units_return_all) {
+    auto sm = semaphore(3);
+    auto units = get_units(sm, 2, 1min).get();
     BOOST_REQUIRE_EQUAL(sm.available_units(), 1);
     BOOST_REQUIRE_THROW(units.return_units(10), std::invalid_argument);
     BOOST_REQUIRE_EQUAL(sm.available_units(), 1);
     units.return_all();
     BOOST_REQUIRE_EQUAL(units.count(), 0);
     BOOST_REQUIRE_EQUAL(sm.available_units(), 3);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_semaphore_try_get_units) {
+    constexpr size_t initial_units = 1;
+    auto sm = semaphore(initial_units);
+
+    auto opt_units = try_get_units(sm, 1);
+    BOOST_REQUIRE(opt_units);
+
+    auto opt_units2 = try_get_units(sm, 1);
+    BOOST_REQUIRE(!opt_units2);
+
+    opt_units.reset();
+    BOOST_REQUIRE_EQUAL(sm.available_units(), initial_units);
+
+    opt_units = try_get_units(sm, 1);
+    BOOST_REQUIRE(opt_units);
+
+    opt_units->return_all();
+    BOOST_REQUIRE_EQUAL(opt_units->count(), 0);
+    BOOST_REQUIRE_EQUAL(sm.available_units(), initial_units);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_semaphore_units_abort) {
+    auto sm = semaphore(3);
+    auto units = get_units(sm, 3, 1min).get();
+    BOOST_REQUIRE_EQUAL(units.count(), 3);
+
+    abort_source as;
+
+    auto f = get_units(sm, 1, as);
+    BOOST_REQUIRE(!f.available());
+
+    (void)sleep(1ms).then([&as] {
+        as.request_abort();
+    });
+
+    BOOST_REQUIRE_THROW(f.get(), semaphore_aborted);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_semaphore_units_bool_operator) {
+    auto sem = semaphore(2);
+    semaphore_units u0;
+    BOOST_REQUIRE(!bool(u0));
+
+    u0 = get_units(sem, 2).get();
+    BOOST_REQUIRE(bool(u0));
+
+    u0.return_units(1);
+    BOOST_REQUIRE(bool(u0));
+
+    auto n = u0.release();
+    BOOST_REQUIRE(!bool(u0));
+    sem.signal(n);
+
+    u0 = get_units(sem, 2).get();
+    BOOST_REQUIRE(bool(u0));
+    auto u1 = std::move(u0);
+    BOOST_REQUIRE(bool(u1));
+    BOOST_REQUIRE(!bool(u0));
+
+    u1.return_all();
+    BOOST_REQUIRE(!bool(u1));
+
+    u0 = get_units(sem, 2).get();
+    BOOST_REQUIRE(bool(u0));
+    u1 = u0.split(1);
+    BOOST_REQUIRE(bool(u1));
+    BOOST_REQUIRE(bool(u0));
+
+    u0.adopt(std::move(u1));
+    BOOST_REQUIRE(!bool(u1));
+    BOOST_REQUIRE(bool(u0));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_named_semaphore_error) {
@@ -308,4 +415,112 @@ SEASTAR_THREAD_TEST_CASE(test_named_semaphore_timeout) {
     } catch (...) {
         BOOST_FAIL("Expected an instance of named_semaphore_timed_out with proper semaphore name");
     }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_semaphore_abort_after_wait) {
+    auto sem = semaphore(0);
+    abort_source as;
+    int x = 0;
+    auto fut1 = sem.wait(as).then([&x] {
+        x++;
+    });
+    as.request_abort();
+    sem.signal();
+    BOOST_CHECK_THROW(fut1.get(), semaphore_aborted);
+    BOOST_REQUIRE_EQUAL(x, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_semaphore_abort_with_exception_after_wait) {
+    auto sem = semaphore(0);
+    abort_source as;
+    int x = 0;
+    auto fut1 = sem.wait(as).then([&x] {
+        x++;
+    });
+    as.request_abort_ex(expected_exception());
+    sem.signal();
+    BOOST_CHECK_THROW(fut1.get(), expected_exception);
+    BOOST_REQUIRE_EQUAL(x, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_semaphore_abort_before_wait) {
+    auto sem = semaphore(0);
+    abort_source as;
+    int x = 0;
+    as.request_abort();
+    auto fut1 = sem.wait(as).then([&x] {
+        x++;
+    });
+    sem.signal();
+    BOOST_CHECK_THROW(fut1.get(), semaphore_aborted);
+    BOOST_REQUIRE_EQUAL(x, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_reassigned_units_are_returned) {
+    auto sem0 = semaphore(1);
+    auto sem1 = semaphore(1);
+    auto units = get_units(sem0, 1).get();
+    auto wait = sem0.wait(1);
+    BOOST_REQUIRE(!wait.available());
+    units = get_units(sem1, 1).get();
+    timer t([] { abort(); });
+    t.arm(1s);
+    // will hang if units are not returned when reassigned
+    wait.get();
+    t.cancel();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_get_units_after_move) {
+    auto sem = std::make_unique<semaphore>([] { return semaphore(0); }());
+    auto f = get_units(*sem, 1);
+    BOOST_REQUIRE(!f.available());
+    sem->signal();
+    f.get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_get_units_abort_after_move) {
+    auto sem = std::make_unique<semaphore>([] { return semaphore(0); }());
+    abort_source as;
+    auto f = get_units(*sem, 1, as);
+    BOOST_REQUIRE(!f.available());
+    as.request_abort();
+
+    BOOST_REQUIRE_THROW(f.get(), abort_requested_exception);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_immediate_abort_after_move) {
+    auto sem = std::make_unique<semaphore>([] { return semaphore(0); }());
+    abort_source as;
+    as.request_abort();
+
+    BOOST_REQUIRE_THROW(get_units(*sem, 1, as).get(), abort_requested_exception);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_get_units_after_move_assign) {
+    auto sem = semaphore(0);
+    sem = [] { return semaphore(0); }();
+    auto f = get_units(sem, 1);
+    BOOST_REQUIRE(!f.available());
+    sem.signal();
+    f.get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_get_units_abort_after_move_assign) {
+    auto sem = semaphore(0);
+    sem = [] { return semaphore(0); }();
+    abort_source as;
+    auto f = get_units(sem, 1, as);
+    BOOST_REQUIRE(!f.available());
+    as.request_abort();
+
+    BOOST_REQUIRE_THROW(f.get(), abort_requested_exception);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_immediate_abort_after_move_assign) {
+    auto sem = semaphore(0);
+    sem = [] { return semaphore(0); }();
+    abort_source as;
+    as.request_abort();
+
+    BOOST_REQUIRE_THROW(get_units(sem, 1, as).get(), abort_requested_exception);
 }

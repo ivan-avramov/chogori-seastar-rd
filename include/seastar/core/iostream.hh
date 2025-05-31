@@ -36,11 +36,26 @@
 #pragma once
 
 #include <seastar/core/future.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/scattered_message.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/modules.hh>
+#ifndef SEASTAR_MODULE
+#include <boost/intrusive/slist.hpp>
+#include <algorithm>
+#include <memory>
+#include <optional>
+#include <variant>
+#include <vector>
+#endif
+
+namespace bi = boost::intrusive;
 
 namespace seastar {
+
+SEASTAR_MODULE_EXPORT_BEGIN
 
 namespace net { class packet; }
 
@@ -57,13 +72,34 @@ class data_source {
 protected:
     data_source_impl* impl() const { return _dsi.get(); }
 public:
+    using tmp_buf = temporary_buffer<char>;
+
     data_source() noexcept = default;
     explicit data_source(std::unique_ptr<data_source_impl> dsi) noexcept : _dsi(std::move(dsi)) {}
     data_source(data_source&& x) noexcept = default;
     data_source& operator=(data_source&& x) noexcept = default;
-    future<temporary_buffer<char>> get() { return _dsi->get(); }
-    future<temporary_buffer<char>> skip(uint64_t n) { return _dsi->skip(n); }
-    future<> close() { return _dsi->close(); }
+
+    future<tmp_buf> get() noexcept {
+        try {
+            return _dsi->get();
+        } catch (...) {
+            return current_exception_as_future<tmp_buf>();
+        }
+    }
+    future<tmp_buf> skip(uint64_t n) noexcept {
+        try {
+            return _dsi->skip(n);
+        } catch (...) {
+            return current_exception_as_future<tmp_buf>();
+        }
+    }
+    future<> close() noexcept {
+        try {
+            return _dsi->close();
+        } catch (...) {
+            return current_exception_as_future<>();
+        }
+    }
 };
 
 class data_sink_impl {
@@ -88,6 +124,41 @@ public:
         return make_ready_future<>();
     }
     virtual future<> close() = 0;
+
+    // The method should return the maximum buffer size that's acceptable by
+    // the sink. It's used when the output stream is constructed without any
+    // specific buffer size. In this case the stream accepts this value as its
+    // buffer size and doesn't put larger buffers (see trim_to_size).
+    virtual size_t buffer_size() const noexcept {
+        SEASTAR_ASSERT(false && "Data sink must have the buffer_size() method overload");
+        return 0;
+    }
+
+    // In order to support flushes batching (output_stream_options.batch_flushes)
+    // the sink mush handle flush errors that may happen in the background by
+    // overriding the on_batch_flush_error() method. If the sink doesn't do it,
+    // turning on batch_flushes would have no effect
+    virtual bool can_batch_flushes() const noexcept {
+        return false;
+    }
+
+    virtual void on_batch_flush_error() noexcept {
+        SEASTAR_ASSERT(false && "Data sink must implement on_batch_flush_error() method");
+    }
+
+protected:
+    // This is a helper function that classes that inherit from data_sink_impl
+    // can use to implement the put overload for net::packet.
+    // Unfortunately, we currently cannot define this function as
+    // 'virtual future<> put(net::packet)', because we would get infinite
+    // recursion between this function and
+    // 'virtual future<> put(temporary_buffer<char>)'.
+    future<> fallback_put(net::packet data) {
+        auto buffers = data.release();
+        for (temporary_buffer<char>& buf : buffers) {
+            co_await this->put(std::move(buf));
+        }
+    }
 };
 
 class data_sink {
@@ -100,19 +171,45 @@ public:
     temporary_buffer<char> allocate_buffer(size_t size) {
         return _dsi->allocate_buffer(size);
     }
-    future<> put(std::vector<temporary_buffer<char>> data) {
+    future<> put(std::vector<temporary_buffer<char>> data) noexcept {
+      try {
         return _dsi->put(std::move(data));
+      } catch (...) {
+        return current_exception_as_future();
+      }
     }
-    future<> put(temporary_buffer<char> data) {
+    future<> put(temporary_buffer<char> data) noexcept {
+      try {
         return _dsi->put(std::move(data));
+      } catch (...) {
+        return current_exception_as_future();
+      }
     }
-    future<> put(net::packet p) {
+    future<> put(net::packet p) noexcept {
+      try {
         return _dsi->put(std::move(p));
+      } catch (...) {
+        return current_exception_as_future();
+      }
     }
-    future<> flush() {
+    future<> flush() noexcept {
+      try {
         return _dsi->flush();
+      } catch (...) {
+        return current_exception_as_future();
+      }
     }
-    future<> close() { return _dsi->close(); }
+    future<> close() noexcept {
+        try {
+            return _dsi->close();
+        } catch (...) {
+            return current_exception_as_future();
+        }
+    }
+
+    size_t buffer_size() const noexcept { return _dsi->buffer_size(); }
+    bool can_batch_flushes() const noexcept { return _dsi->can_batch_flushes(); }
+    void on_batch_flush_error() noexcept { _dsi->on_batch_flush_error(); }
 };
 
 struct continue_consuming {};
@@ -162,7 +259,7 @@ private:
 };
 
 // Consumer concept, for consume() method
-SEASTAR_CONCEPT(
+
 // The consumer should operate on the data given to it, and
 // return a future "consumption result", which can be
 //  - continue_consuming, if the consumer has consumed all the input given
@@ -190,7 +287,6 @@ template <typename Consumer, typename CharType>
 concept ObsoleteInputStreamConsumer = requires (Consumer c) {
     { c(temporary_buffer<CharType>{}) } -> std::same_as<future<std::optional<temporary_buffer<CharType>>>>;
 };
-)
 
 /// Buffers data from a data_source and provides a stream interface to the user.
 ///
@@ -204,10 +300,10 @@ class input_stream final {
     bool _eof = false;
 private:
     using tmp_buf = temporary_buffer<CharType>;
-    size_t available() const { return _buf.size(); }
+    size_t available() const noexcept { return _buf.size(); }
 protected:
-    void reset() { _buf = {}; }
-    data_source* fd() { return &_fd; }
+    void reset() noexcept { _buf = {}; }
+    data_source* fd() noexcept { return &_fd; }
 public:
     using consumption_result_type = consumption_result<CharType>;
     // unconsumed_remainder is mapped for compatibility only; new code should use consumption_result_type
@@ -227,20 +323,25 @@ public:
     ///
     /// \throws if an I/O error occurs during the read. As explained above,
     /// prematurely reaching the end of stream is *not* an I/O error.
-    future<temporary_buffer<CharType>> read_exactly(size_t n);
+    future<temporary_buffer<CharType>> read_exactly(size_t n) noexcept;
     template <typename Consumer>
-    SEASTAR_CONCEPT(requires InputStreamConsumer<Consumer, CharType> || ObsoleteInputStreamConsumer<Consumer, CharType>)
-    future<> consume(Consumer&& c);
+    requires InputStreamConsumer<Consumer, CharType> || ObsoleteInputStreamConsumer<Consumer, CharType>
+    future<> consume(Consumer&& c) noexcept(std::is_nothrow_move_constructible_v<Consumer>);
     template <typename Consumer>
-    SEASTAR_CONCEPT(requires InputStreamConsumer<Consumer, CharType> || ObsoleteInputStreamConsumer<Consumer, CharType>)
-    future<> consume(Consumer& c);
-    bool eof() const { return _eof; }
+    requires InputStreamConsumer<Consumer, CharType> || ObsoleteInputStreamConsumer<Consumer, CharType>
+    future<> consume(Consumer& c) noexcept(std::is_nothrow_move_constructible_v<Consumer>);
+    /// Returns true if the end-of-file flag is set on the stream.
+    /// Note that the eof flag is only set after a previous attempt to read
+    /// from the stream noticed the end of the stream. In other words, it is
+    /// possible that eof() returns false but read() will return an empty
+    /// buffer. Checking eof() again after the read will return true.
+    bool eof() const noexcept { return _eof; }
     /// Returns some data from the stream, or an empty buffer on end of
     /// stream.
-    future<tmp_buf> read();
+    future<tmp_buf> read() noexcept;
     /// Returns up to n bytes from the stream, or an empty buffer on end of
     /// stream.
-    future<tmp_buf> read_up_to(size_t n);
+    future<tmp_buf> read_up_to(size_t n) noexcept;
     /// Detaches the \c input_stream from the underlying data source.
     ///
     /// Waits for any background operations (for example, read-ahead) to
@@ -250,11 +351,11 @@ public:
     ///
     /// \return a future that becomes ready when this stream no longer
     ///         needs the data source.
-    future<> close() {
+    future<> close() noexcept {
         return _fd.close();
     }
     /// Ignores n next bytes from the stream.
-    future<> skip(uint64_t n);
+    future<> skip(uint64_t n) noexcept;
 
     /// Detaches the underlying \c data_source from the \c input_stream.
     ///
@@ -269,7 +370,13 @@ public:
     /// \returns the data_source
     data_source detach() &&;
 private:
-    future<temporary_buffer<CharType>> read_exactly_part(size_t n, tmp_buf buf, size_t completed);
+    future<temporary_buffer<CharType>> read_exactly_part(size_t n) noexcept;
+};
+
+struct output_stream_options {
+    bool trim_to_size = false; ///< Make sure that buffers put into sink haven't
+                               ///< grown larger than the configured size
+    bool batch_flushes = false; ///< Try to merge flushes with each other
 };
 
 /// Facilitates data buffering before it's handed over to data_sink.
@@ -298,40 +405,53 @@ class output_stream final {
     bool _flush = false;
     bool _flushing = false;
     std::exception_ptr _ex;
+    bi::slist_member_hook<> _in_poller;
+
 private:
-    size_t available() const { return _end - _begin; }
-    size_t possibly_available() const { return _size - _begin; }
-    future<> split_and_put(temporary_buffer<CharType> buf);
-    future<> put(temporary_buffer<CharType> buf);
-    void poll_flush();
-    future<> zero_copy_put(net::packet p);
-    future<> zero_copy_split_and_put(net::packet p);
+    size_t available() const noexcept { return _end - _begin; }
+    future<> split_and_put(temporary_buffer<CharType> buf) noexcept;
+    future<> put(temporary_buffer<CharType> buf) noexcept;
+    void poll_flush() noexcept;
+    future<> do_flush() noexcept;
+    future<> zero_copy_put(net::packet p) noexcept;
+    future<> zero_copy_split_and_put(net::packet p) noexcept;
     [[gnu::noinline]]
-    future<> slow_write(const CharType* buf, size_t n);
+    future<> slow_write(const CharType* buf, size_t n) noexcept;
 public:
     using char_type = CharType;
     output_stream() noexcept = default;
-    output_stream(data_sink fd, size_t size, bool trim_to_size = false, bool batch_flushes = false) noexcept
-        : _fd(std::move(fd)), _size(size), _trim_to_size(trim_to_size), _batch_flushes(batch_flushes) {}
+    output_stream(data_sink fd, size_t size, output_stream_options opts = {}) noexcept
+        : _fd(std::move(fd)), _size(size), _trim_to_size(opts.trim_to_size), _batch_flushes(opts.batch_flushes && _fd.can_batch_flushes()) {}
+    [[deprecated("use output_stream_options instead of booleans")]]
+    output_stream(data_sink fd, size_t size, bool trim_to_size, bool batch_flushes = false) noexcept
+        : _fd(std::move(fd)), _size(size), _trim_to_size(trim_to_size), _batch_flushes(batch_flushes && _fd.can_batch_flushes()) {}
+    output_stream(data_sink fd) noexcept
+        : _fd(std::move(fd)), _size(_fd.buffer_size()), _trim_to_size(true) {}
     output_stream(output_stream&&) noexcept = default;
     output_stream& operator=(output_stream&&) noexcept = default;
-    ~output_stream() { assert(!_in_batch && "Was this stream properly closed?"); }
-    future<> write(const char_type* buf, size_t n);
-    future<> write(const char_type* buf);
+    ~output_stream() {
+        if (_batch_flushes) {
+            SEASTAR_ASSERT(!_in_batch && "Was this stream properly closed?");
+        } else {
+            SEASTAR_ASSERT(!_end && !_zc_bufs && "Was this stream properly closed?");
+        }
+    }
+    future<> write(const char_type* buf, size_t n) noexcept;
+    future<> write(const char_type* buf) noexcept;
 
     template <typename StringChar, typename SizeType, SizeType MaxSize, bool NulTerminate>
-    future<> write(const basic_sstring<StringChar, SizeType, MaxSize, NulTerminate>& s);
-    future<> write(const std::basic_string<char_type>& s);
+    future<> write(const basic_sstring<StringChar, SizeType, MaxSize, NulTerminate>& s) noexcept;
+    future<> write(const std::basic_string<char_type>& s) noexcept;
 
-    future<> write(net::packet p);
-    future<> write(scattered_message<char_type> msg);
-    future<> write(temporary_buffer<char_type>);
-    future<> flush();
+    future<> write(net::packet p) noexcept;
+    future<> write(scattered_message<char_type> msg) noexcept;
+    future<> write(temporary_buffer<char_type>) noexcept;
+    future<> flush() noexcept;
 
     /// Flushes the stream before closing it (and the underlying data sink) to
     /// any further writes.  The resulting future must be waited on before
     /// destroying this object.
-    future<> close();
+    future<> close() noexcept;
 
     /// Detaches the underlying \c data_sink from the \c output_stream.
     ///
@@ -345,6 +465,10 @@ public:
     ///
     /// \returns the data_sink
     data_sink detach() &&;
+
+    using batch_flush_list_t = bi::slist<output_stream,
+            bi::constant_time_size<false>, bi::cache_last<true>,
+            bi::member_hook<output_stream, bi::slist_member_hook<>, &output_stream::_in_poller>>;
 private:
     friend class reactor;
 };
@@ -355,6 +479,7 @@ private:
 template <typename CharType>
 future<> copy(input_stream<CharType>&, output_stream<CharType>&);
 
+SEASTAR_MODULE_EXPORT_END
 }
 
 #include "iostream-impl.hh"

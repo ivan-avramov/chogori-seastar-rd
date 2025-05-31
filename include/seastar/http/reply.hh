@@ -31,18 +31,29 @@
 //
 #pragma once
 
-#include <seastar/core/sstring.hh>
+#ifndef SEASTAR_MODULE
 #include <unordered_map>
+#endif
+#include <seastar/core/sstring.hh>
 #include <seastar/http/mime_types.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/util/noncopyable_function.hh>
+#include <seastar/util/modules.hh>
+#include <seastar/util/string_utils.hh>
+#include <seastar/util/iostream.hh>
 
 namespace seastar {
+
+SEASTAR_MODULE_EXPORT_BEGIN
 
 namespace httpd {
 
 class connection;
 class routes;
+
+}
+
+namespace http {
 
 /**
  * A reply to be sent to a client.
@@ -53,38 +64,101 @@ struct reply {
      */
     enum class status_type {
         continue_ = 100, //!< continue
+        switching_protocols = 101, //!< switching_protocols
         ok = 200, //!< ok
         created = 201, //!< created
         accepted = 202, //!< accepted
+        nonauthoritative_information = 203, //!< nonauthoritative_information
         no_content = 204, //!< no_content
+        reset_content = 205, //!< reset_content
+        partial_content = 206, //! partial_content
         multiple_choices = 300, //!< multiple_choices
         moved_permanently = 301, //!< moved_permanently
         moved_temporarily = 302, //!< moved_temporarily
+        see_other = 303, //!< see_other
         not_modified = 304, //!< not_modified
+        use_proxy = 305, //!< use_proxy
+        temporary_redirect = 307, //!< temporary_redirect
         bad_request = 400, //!< bad_request
         unauthorized = 401, //!< unauthorized
+        payment_required = 402, //!< payment_required
         forbidden = 403, //!< forbidden
         not_found = 404, //!< not_found
+        method_not_allowed = 405, //!< method_not_allowed
+        not_acceptable = 406, //!< not_acceptable
+        request_timeout = 408, //!< request_timeout
+        conflict = 409, //!< conflict
+        gone = 410, //!< gone
         length_required = 411, //!< length_required
         payload_too_large = 413, //!< payload_too_large
+        uri_too_long = 414, //!< uri_too_long
+        unsupported_media_type = 415, //!< unsupported_media_type
+        expectation_failed = 417, //!< expectation_failed
+        page_expired = 419, //!< page_expired
+        unprocessable_entity = 422, //!< unprocessable_entity
+        upgrade_required = 426, //!< upgrade_required
+        too_many_requests = 429, //!< too_many_requests
+        login_timeout = 440, //!< login_timeout
         internal_server_error = 500, //!< internal_server_error
         not_implemented = 501, //!< not_implemented
         bad_gateway = 502, //!< bad_gateway
-        service_unavailable = 503  //!< service_unavailable
+        service_unavailable = 503,  //!< service_unavailable
+        gateway_timeout = 504, //!< gateway_timeout
+        http_version_not_supported = 505, //!< http_version_not_supported
+        insufficient_storage = 507, //!< insufficient_storage
+        bandwidth_limit_exceeded = 509, //!< bandwidth_limit_exceeded
+        network_read_timeout = 598, //!< network_read_timeout
+        network_connect_timeout = 599, //!< network_connect_timeout
     } _status;
+
+    /**
+     * HTTP status classes
+     * See https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml
+     *
+     * 1xx: Informational - Request received, continuing process
+     * 2xx: Success - The action was successfully received, understood, and accepted
+     * 3xx: Redirection - Further action must be taken in order to complete the request
+     * 4xx: Client Error - The request contains bad syntax or cannot be fulfilled
+     * 5xx: Server Error - The server failed to fulfill an apparently valid request
+     */
+    enum class status_class : uint8_t {
+        informational = 1,
+        success = 2,
+        redirection = 3,
+        client_error = 4,
+        server_error = 5,
+        unclassified
+    };
+
+    /**
+     * Classify http status
+     * @param http_status the http status \ref status_type
+     * @return one of the \ref status_class values
+     */
+    static constexpr status_class classify_status(status_type http_status) {
+        auto sc = static_cast<std::underlying_type_t<status_type>>(http_status) / 100;
+        if (sc < 1 || sc > 5) [[unlikely]] {
+            return status_class::unclassified;
+        }
+        return static_cast<status_class>(sc);
+    }
 
     /**
      * The headers to be included in the reply.
      */
-    std::unordered_map<sstring, sstring> _headers;
+    std::unordered_map<sstring, sstring, seastar::internal::case_insensitive_hash, seastar::internal::case_insensitive_cmp> _headers;
 
     sstring _version;
     /**
      * The content to be sent in the reply.
      */
     sstring _content;
+    size_t content_length = 0; // valid when received via client connection
 
     sstring _response_line;
+    std::unordered_map<sstring, sstring> trailing_headers;
+    std::unordered_map<sstring, sstring> chunk_extensions;
+
     reply()
             : _status(status_type::ok) {
     }
@@ -94,15 +168,28 @@ struct reply {
         return *this;
     }
 
+    /**
+     * Search for the first header of a given name
+     * @param name the header name
+     * @return a pointer to the header value, if it exists or empty string
+     */
+    sstring get_header(const sstring& name) const {
+        auto res = _headers.find(name);
+        if (res == _headers.end()) {
+            return "";
+        }
+        return res->second;
+    }
+
     reply& set_version(const sstring& version) {
         _version = version;
         return *this;
     }
 
-    reply& set_status(status_type status, const sstring& content = "") {
+    reply& set_status(status_type status, sstring content = "") {
         _status = status;
         if (content != "") {
-            _content = content;
+            _content = std::move(content);
         }
         return *this;
     }
@@ -122,7 +209,7 @@ struct reply {
      * that would have been used if it was a file: e.g. html, txt, json etc'
      */
     reply& set_content_type(const sstring& content_type = "html") {
-        set_mime_type(httpd::mime_types::extension_to_type(content_type));
+        set_mime_type(http::mime_types::extension_to_type(content_type));
         return *this;
     }
 
@@ -137,7 +224,7 @@ struct reply {
         _response_line = response_line();
         return *this;
     }
-    sstring response_line();
+    sstring response_line() const;
 
     /*!
      * \brief use an output stream to write the message body
@@ -158,6 +245,20 @@ struct reply {
     void write_body(const sstring& content_type, noncopyable_function<future<>(output_stream<char>&&)>&& body_writer);
 
     /*!
+     * \brief use and output stream to write the message body
+     *
+     * The same as above, but the handler can only .write() data into the stream, it will be
+     * closed (and flushed) automatically after the writer fn resolves
+     */
+    template <typename W>
+    requires std::is_invocable_r_v<future<>, W, output_stream<char>&>
+    void write_body(const sstring& content_type, W&& body_writer) {
+        write_body(content_type, [body_writer = std::move(body_writer)] (output_stream<char>&& out) mutable -> future<> {
+            return util::write_to_stream_and_close(std::move(out), std::move(body_writer));
+        });
+    }
+
+    /*!
      * \brief Write a string as the reply
      *
      * \param content_type - is used to choose the content type of the body. Use the file extension
@@ -166,7 +267,7 @@ struct reply {
      * This would set the the content and content type of the message along
      * with any additional information that is needed to send the message.
      */
-    void write_body(const sstring& content_type, const sstring& content);
+    void write_body(const sstring& content_type, sstring content);
 
     /*!
      * \brief Write the body in this reply to the given stream
@@ -174,6 +275,9 @@ struct reply {
      * \param out - the stream to write the reply into
      */
     future<> write_reply_body_to_stream(output_stream<char>& out);
+private:
+    future<> write_reply_to_connection(httpd::connection& con);
+    future<> write_reply_headers(httpd::connection& connection);
 
     /*!
      * \brief Write this reply to the given output stream
@@ -186,10 +290,21 @@ struct reply {
 
 private:
     noncopyable_function<future<>(output_stream<char>&&)> _body_writer;
-    friend class routes;
-    friend class connection;
+    friend class httpd::routes;
+    friend class httpd::connection;
 };
 
-} // namespace httpd
+std::ostream& operator<<(std::ostream& os, reply::status_type st);
 
+} // namespace http
+
+namespace httpd {
+using reply [[deprecated("Use http::reply instead")]] = http::reply;
 }
+
+SEASTAR_MODULE_EXPORT_END
+}
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<seastar::http::reply::status_type> : fmt::ostream_formatter {};
+#endif

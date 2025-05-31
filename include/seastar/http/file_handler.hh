@@ -23,11 +23,13 @@
 
 #include <seastar/http/handlers.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/util/modules.hh>
 
 namespace seastar {
 
 namespace httpd {
 
+SEASTAR_MODULE_EXPORT_BEGIN
 /**
  * This is a base class for file transformer.
  *
@@ -47,9 +49,10 @@ public:
      * @param extension the file extension originating the content
      * returns a new output stream to be used when writing the file to the reply
      */
-    virtual output_stream<char> transform(std::unique_ptr<request> req,
+    virtual output_stream<char> transform(std::unique_ptr<http::request> req,
             const sstring& extension, output_stream<char>&& s) = 0;
-
+    file_transformer() = default;
+    file_transformer(file_transformer&&) = default;
     virtual ~file_transformer() = default;
 };
 
@@ -85,7 +88,7 @@ public:
      * @param rep the reply
      * @return true on redirect
      */
-    bool redirect_if_needed(const request& req, reply& rep) const;
+    bool redirect_if_needed(const http::request& req, http::reply& rep) const;
 
     /**
      * A helper method that returns the file extension.
@@ -102,11 +105,11 @@ protected:
      * @param req the reuest
      * @param rep the reply
      */
-    future<std::unique_ptr<reply> > read(sstring file,
-            std::unique_ptr<request> req, std::unique_ptr<reply> rep);
+    future<std::unique_ptr<http::reply> > read(sstring file,
+            std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep);
     file_transformer* transformer;
 
-    output_stream<char> get_stream(std::unique_ptr<request> req,
+    output_stream<char> get_stream(std::unique_ptr<http::request> req,
             const sstring& extension, output_stream<char>&& s);
 };
 
@@ -132,8 +135,8 @@ public:
     explicit directory_handler(const sstring& doc_root,
             file_transformer* transformer = nullptr);
 
-    future<std::unique_ptr<reply>> handle(const sstring& path,
-            std::unique_ptr<request> req, std::unique_ptr<reply> rep) override;
+    future<std::unique_ptr<http::reply>> handle(const sstring& path,
+            std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) override;
 
 private:
     sstring doc_root;
@@ -159,14 +162,15 @@ public:
                     force_path) {
     }
 
-    future<std::unique_ptr<reply>> handle(const sstring& path,
-            std::unique_ptr<request> req, std::unique_ptr<reply> rep) override;
+    future<std::unique_ptr<http::reply>> handle(const sstring& path,
+            std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) override;
 
 private:
     sstring file;
     bool force_path;
 };
 
+SEASTAR_MODULE_EXPORT_END
 }
 
 }

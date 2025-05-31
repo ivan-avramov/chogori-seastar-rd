@@ -21,8 +21,10 @@
 
 #include <seastar/testing/perf_tests.hh>
 
+#include <cstdio>
 #include <fstream>
 #include <regex>
+#include <type_traits>
 
 #include <boost/range.hpp>
 #include <boost/range/adaptors.hpp>
@@ -36,8 +38,17 @@
 #include <seastar/json/formatter.hh>
 #include <seastar/util/later.hh>
 #include <seastar/testing/random.hh>
+#include <seastar/core/memory.hh>
+#include <seastar/core/reactor.hh>
 
 #include <signal.h>
+
+#if FMT_VERSION >= 90000
+namespace perf_tests::internal {
+    struct duration;
+}
+template <> struct fmt::formatter<perf_tests::internal::duration> : fmt::ostream_formatter {};
+#endif
 
 namespace perf_tests {
 namespace internal {
@@ -106,6 +117,23 @@ private:
 
 }
 
+uint64_t perf_stats::perf_mallocs() {
+    return memory::stats().mallocs();
+}
+
+uint64_t perf_stats::perf_tasks_processed() {
+    return engine().get_sched_stats().tasks_processed;
+}
+
+perf_stats perf_stats::snapshot(linux_perf_event* instructions_retired_counter, linux_perf_event* cpu_cycles_retired_counter) {
+    return perf_stats(
+        perf_mallocs(),
+        perf_tasks_processed(),
+        instructions_retired_counter ? instructions_retired_counter->read() : 0,
+        cpu_cycles_retired_counter ? cpu_cycles_retired_counter->read() : 0
+    );
+}
+
 time_measurement measure_time;
 
 struct config;
@@ -116,6 +144,17 @@ struct result_printer {
 
     virtual void print_configuration(const config&) = 0;
     virtual void print_result(const result&) = 0;
+
+    void update_name_column_length(size_t length) {
+        _name_column_length = std::max(1ul, length);
+    }
+    size_t name_column_length() const {
+        return _name_column_length;
+    }
+
+private:
+    static constexpr size_t DEFAULT_NAME_COLUMN_LENGTH = 40;
+    size_t _name_column_length = DEFAULT_NAME_COLUMN_LENGTH;
 };
 
 struct config {
@@ -127,18 +166,22 @@ struct config {
 };
 
 struct result {
-    sstring test_name;
+    sstring test_name = "";
 
-    uint64_t total_iterations;
-    unsigned runs;
+    uint64_t total_iterations = 0;
+    unsigned runs = 0;
 
-    double median;
-    double mad;
-    double min;
-    double max;
+    double median = 0.;
+    double mad = 0.;
+    double min = 0.;
+    double max = 0.;
+
+    double allocs = 0.;
+    double tasks = 0.;
+    double inst = 0.;
+    double cycles = 0.;
 };
 
-namespace {
 
 struct duration {
     double value;
@@ -161,9 +204,97 @@ static inline std::ostream& operator<<(std::ostream& os, duration d)
     return os;
 }
 
+/**
+ * A column object encapsulates the logic needed to print one
+ * type of result value, usually as a column (or a json attribute).
+ *
+ * This allows all printers to share a common view of the available
+ * columns.
+ */
+struct column {
+    static constexpr int default_width = 11;
+
+    using print_fn = std::function<void(const column&, std::FILE *file, const result& r)>;
+
+    template <typename F>
+    column(sstring header, int prec, F fn) : header{header}, prec{prec} {
+        using result_t = std::invoke_result_t<F,const result&>;
+        constexpr auto is_integral = std::is_integral_v<result_t>;
+        constexpr auto is_double = std::is_same_v<result_t, double>;
+        constexpr auto is_duration = std::is_same_v<result_t, duration>;
+        static_assert(is_integral || is_double || is_duration, "unsupported return type");
+        static constexpr std::string_view fmt_str = is_double ? "{:>{}.{}f}": "{:>{}}";
+        print_text = [=](const column& c, std::FILE *file, const result& r) {
+            fmt::print(file, fmt_str, fn(r), c.width, c.prec);
+        };
+        to_double = [fn](const result& r) {
+            if constexpr (is_duration) {
+                return fn(r).value;
+            } else {
+                return static_cast<double>(fn(r));
+            }
+        };
+    }
+
+    void print_header(std::FILE *file, const char* str = nullptr) const {
+        fmt::print(file, "{:>{}}", str ? str : header, width);
+    }
+
+    // column header
+    sstring header;
+
+    // width for the column in text output
+    int width = 11;
+
+    // precision in case of double
+    int prec = 3;
+
+    // used by stdout and md formats to print as text
+    print_fn print_text;
+
+    // used by json format to extract double result
+    std::function<double(const result&)> to_double;
+};
+
+using columns = std::vector<column>;
+
+static void print_result_columns(std::FILE* out,
+    const columns& cols,
+    int name_length,
+    const result& r,
+    const char* start_delim = "",
+    const char* middle_delim = " ",
+    const char* end_delim = ""
+    ) {
+
+    fmt::print(out, "{}{:<{}}", start_delim, r.test_name, name_length);
+    for (auto& c : cols) {
+        fmt::print(out, "{}", middle_delim);
+        c.print_text(c, out, r);
+    }
+    fmt::print(out, "{}\n", end_delim);
 }
 
-static constexpr auto format_string = "{:<40} {:>11} {:>11} {:>11} {:>11} {:>11}\n";
+// columns for json ouput
+static const std::vector<column> json_columns{
+    {"median", 0, [](const result& r) { return duration { r.median }; }},
+    {"mad"   , 0, [](const result& r) { return duration { r.mad };    }},
+    {"min"   , 0, [](const result& r) { return duration { r.min };    }},
+    {"max"   , 0, [](const result& r) { return duration { r.max };    }},
+    {"allocs", 3, [](const result& r) { return r.allocs;              }},
+    {"tasks" , 3, [](const result& r) { return r.tasks;               }},
+    {"inst"  , 1, [](const result& r) { return r.inst;                }},
+    {"cycles", 1, [](const result& r) { return r.cycles;              }},
+};
+
+// columns for text output
+const std::vector<column> text_columns = [] { 
+    std::vector<column> ret{
+        {"iterations" , 0, [](const result& r) { return r.total_iterations / r.runs; }}
+    };
+    ret.insert(ret.end(), json_columns.begin(), json_columns.end());
+    return ret;
+}();
 
 struct stdout_printer final : result_printer {
   virtual void print_configuration(const config& c) override {
@@ -173,12 +304,19 @@ struct stdout_printer final : result_printer {
                "number of runs:", c.number_of_runs,
                "number of cores:", smp::count,
                "random seed:", c.random_seed);
-    fmt::print(format_string, "test", "iterations", "median", "mad", "min", "max");
+
+    fmt::print("{:<{}}", "test", name_column_length());
+    for (auto& c : text_columns) {
+        // a middle delimiter between each column
+        fmt::print(" ");
+        c.print_header(stdout);
+    }
+    // end of line
+    fmt::print("\n");
   }
 
   virtual void print_result(const result& r) override {
-    fmt::print(format_string, r.test_name, r.total_iterations / r.runs, duration { r.median },
-               duration { r.mad }, duration { r.min }, duration { r.max });
+    print_result_columns(stdout, text_columns, name_column_length(), r);
   }
 };
 
@@ -201,11 +339,58 @@ public:
         auto& result = _root["results"][r.test_name];
         result["runs"] = r.runs;
         result["total_iterations"] = r.total_iterations;
-        result["median"] = r.median;
-        result["mad"] = r.mad;
-        result["min"] = r.min;
-        result["max"] = r.max;
+
+        for (auto& c : json_columns) {
+            result[c.header] = c.to_double(r);
+        }
     }
+};
+
+class markdown_printer final : public result_printer {
+    std::FILE* _output = nullptr;
+
+    void print_header_row(const char* head_text, const char* body_text) {
+        // start delimeter, and the top-left cell
+        fmt::print(_output, "| {:<{}}", head_text, name_column_length());
+        // the header cells
+        for (auto& c : text_columns) {
+            // middle delimeter
+            fmt::print(_output, " | ");
+            // right align the text in result cells
+            c.print_header(_output, body_text);
+        }
+        // end delimeter
+        fmt::print(_output, " |\n");
+    }
+
+public:
+    explicit markdown_printer(const std::string& filename) {
+        if (filename == "-") {
+            _output = stdout;
+        } else {
+            _output = std::fopen(filename.c_str(), "w");
+        }
+        if (!_output) {
+            throw std::invalid_argument(fmt::format("unable to write to {}", filename));
+        }
+    }
+    ~markdown_printer() {
+        if (_output != stdout) {
+            std::fclose(_output);
+        }
+    }
+
+    void print_configuration(const config&) override {
+        // print the header row
+        print_header_row("test", nullptr);
+        // then the divider row of all -
+        print_header_row("-", "-:");
+    }
+
+    void print_result(const result& r) override {
+        print_result_columns(_output, text_columns, name_column_length(), r, "| ", " | ", " |");
+    }
+
 };
 
 void performance_test::do_run(const config& conf)
@@ -222,7 +407,7 @@ void performance_test::do_run(const config& conf)
     // dry run, estimate the number of iterations
     if (conf.single_run_duration.count()) {
         // switch out of seastar thread
-        later().then([&] {
+        yield().then([&] {
             tmr.arm(conf.single_run_duration);
             return do_single_run().finally([&] {
                 tmr.cancel();
@@ -231,22 +416,29 @@ void performance_test::do_run(const config& conf)
         }).get();
     }
 
+    result r{};
+
     auto results = std::vector<double>(conf.number_of_runs);
     uint64_t total_iterations = 0;
     for (auto i = 0u; i < conf.number_of_runs; i++) {
         // switch out of seastar thread
-        later().then([&] {
+        yield().then([&] {
             _single_run_iterations = 0;
-            return do_single_run().then([&] (clock_type::duration dt) {
+            return do_single_run().then([&] (run_result rr) {
+                clock_type::duration dt = rr.duration;
                 double ns = std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count();
                 results[i] = ns / _single_run_iterations;
 
                 total_iterations += _single_run_iterations;
+
+                r.allocs += double(rr.stats.allocations) / _single_run_iterations;
+                r.tasks += double(rr.stats.tasks_executed) / _single_run_iterations;
+                r.inst += double(rr.stats.instructions_retired) / _single_run_iterations;
+                r.cycles += double(rr.stats.cpu_cycles_retired) / _single_run_iterations;
             });
         }).get();
     }
 
-    result r{};
     r.test_name = name();
     r.total_iterations = total_iterations;
     r.runs = conf.number_of_runs;
@@ -264,6 +456,11 @@ void performance_test::do_run(const config& conf)
 
     r.min = results[0];
     r.max = results[results.size() - 1];
+
+    r.allocs /= conf.number_of_runs;
+    r.tasks /= conf.number_of_runs;
+    r.inst /= conf.number_of_runs;
+    r.cycles /= conf.number_of_runs;
 
     for (auto& rp : conf.printers) {
         rp->print_result(r);
@@ -293,7 +490,7 @@ void performance_test::register_test(std::unique_ptr<performance_test> test)
     all_tests().emplace_back(std::move(test));
 }
 
-void run_all(const std::vector<std::string>& tests, const config& conf)
+void run_all(const std::vector<std::string>& tests, config& conf)
 {
     auto can_run = [tests = boost::copy_range<std::vector<std::regex>>(tests)] (auto&& test) {
         auto it = boost::range::find_if(tests, [&test] (const std::regex& regex) {
@@ -302,7 +499,13 @@ void run_all(const std::vector<std::string>& tests, const config& conf)
         return tests.empty() || it != tests.end();
     };
 
+    size_t max_name_column_length = 0;
+    for (auto&& test : all_tests() | boost::adaptors::filtered(can_run)) {
+        max_name_column_length = std::max(max_name_column_length, test->name().size());
+    }
+
     for (auto& rp : conf.printers) {
+        rp->update_name_column_length(max_name_column_length);
         rp->print_configuration(conf);
     }
     for (auto&& test : all_tests() | boost::adaptors::filtered(std::move(can_run))) {
@@ -330,6 +533,7 @@ int main(int ac, char** av)
             "random number generator seed")
         ("no-stdout", "do not print to stdout")
         ("json-output", bpo::value<std::string>(), "output json file")
+        ("md-output", bpo::value<std::string>(), "output markdown file")
         ("list", "list available tests")
         ;
 
@@ -364,6 +568,12 @@ int main(int ac, char** av)
             if (app.configuration().count("json-output")) {
                 conf.printers.emplace_back(std::make_unique<json_printer>(
                     app.configuration()["json-output"].as<std::string>()
+                ));
+            }
+
+            if (app.configuration().count("md-output")) {
+                conf.printers.emplace_back(std::make_unique<markdown_printer>(
+                    app.configuration()["md-output"].as<std::string>()
                 ));
             }
 

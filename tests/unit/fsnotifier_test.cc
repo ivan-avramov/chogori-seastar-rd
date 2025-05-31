@@ -27,12 +27,13 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/core/fsnotify.hh>
 
-#include "../../src/core/fsnotify.hh"
 #include "tmpdir.hh"
 
 namespace fs = std::filesystem;
 using namespace seastar;
+using experimental::fsnotifier;
 
 static bool find_event(const std::vector<fsnotifier::event>& events, const fsnotifier::watch& w, fsnotifier::flags mask, std::optional<sstring> path = {}) {
     auto i = std::find_if(events.begin(), events.end(), [&](const fsnotifier::event& e) {
@@ -49,32 +50,32 @@ SEASTAR_THREAD_TEST_CASE(test_notify_modify_close_delete) {
     fsnotifier fsn;
 
     auto p = tmp.path() / "kossa.dat";
-    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get0();
+    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get();
     auto w = fsn.create_watch(p.native(), fsnotifier::flags::delete_self
         | fsnotifier::flags::modify
         | fsnotifier::flags::close
-    ).get0();
+    ).get();
 
-    auto os = api_v3::and_newer::make_file_output_stream(f).get0();
+    auto os = make_file_output_stream(f).get();
     os.write("kossa").get();
     os.flush().get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::modify));
     }
 
     os.close().get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::close_write));
     }
 
     remove_file(p.native()).get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::delete_self));
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::ignored));
     }
@@ -87,8 +88,8 @@ SEASTAR_THREAD_TEST_CASE(test_notify_overwrite) {
     auto p = tmp.path() / "kossa.dat";
 
     auto write_file = [](fs::path& p, sstring content) {
-        auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get0();
-        auto os = api_v3::and_newer::make_file_output_stream(f).get0();
+        auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get();
+        auto os = make_file_output_stream(f).get();
         os.write(content).get();
         os.flush().get();
         os.close().get();
@@ -99,31 +100,31 @@ SEASTAR_THREAD_TEST_CASE(test_notify_overwrite) {
     auto w = fsn.create_watch(p.native(), fsnotifier::flags::delete_self
         | fsnotifier::flags::modify
         | fsnotifier::flags::close
-    ).get0();
+    ).get();
 
     write_file(p, "kossabello");
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::modify));
     }
 
     write_file(p, "kossaruffalobill");
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::modify));
     }
 
     auto p2 = tmp.path() / "tmp.apa";
     write_file(p2, "le apa");
 
-    auto w2 = fsn.create_watch(tmp.path().native(), fsnotifier::flags::move_to).get0();
+    auto w2 = fsn.create_watch(tmp.path().native(), fsnotifier::flags::move_to).get();
 
     rename_file(p2.native(), p.native()).get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::delete_self));
         BOOST_REQUIRE(find_event(events, w2, fsnotifier::flags::move_to, p.filename().native()));
     }
@@ -136,12 +137,12 @@ SEASTAR_THREAD_TEST_CASE(test_notify_create_delete_child) {
     auto p = tmp.path() / "kossa.dat";
     auto w = fsn.create_watch(tmp.path().native(), fsnotifier::flags::create_child
         | fsnotifier::flags::delete_child
-    ).get0();
+    ).get();
 
-    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get0();
+    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::create_child));
     }
 
@@ -149,7 +150,7 @@ SEASTAR_THREAD_TEST_CASE(test_notify_create_delete_child) {
     remove_file(p.native()).get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::delete_child));
         BOOST_REQUIRE(!find_event(events, w, fsnotifier::flags::ignored));
     }
@@ -160,15 +161,15 @@ SEASTAR_THREAD_TEST_CASE(test_notify_open) {
     fsnotifier fsn;
 
     auto p = tmp.path() / "kossa.dat";
-    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get0();
+    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get();
     f.close().get();
 
-    auto w = fsn.create_watch(p.native(), fsnotifier::flags::open).get0();
+    auto w = fsn.create_watch(p.native(), fsnotifier::flags::open).get();
 
-    auto f2 = open_file_dma(p.native(), open_flags::ro).get0();
+    auto f2 = open_file_dma(p.native(), open_flags::ro).get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::open));
     }
 
@@ -180,29 +181,29 @@ SEASTAR_THREAD_TEST_CASE(test_notify_move) {
     fsnotifier fsn;
 
     auto p = tmp.path() / "kossa.dat";
-    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get0();
+    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get();
 
     f.close().get();
 
-    auto w = fsn.create_watch(tmp.path().native(), fsnotifier::flags::move).get0();
+    auto w = fsn.create_watch(tmp.path().native(), fsnotifier::flags::move).get();
     auto p2 = tmp.path() / "kossa.mu";
 
     rename_file(p.native(), p2.native()).get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::move_from, p.filename().native()));
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::move_to, p2.filename().native()));
     }
 
     tmpdir tmp2;
     auto p3 = tmp2.path() / "ninja.mission";
-    auto w2 = fsn.create_watch(tmp2.path().native(), fsnotifier::flags::move).get0();
+    auto w2 = fsn.create_watch(tmp2.path().native(), fsnotifier::flags::move).get();
 
     rename_file(p2.native(), p3.native()).get();
 
     {
-        auto events = fsn.wait().get0();
+        auto events = fsn.wait().get();
         BOOST_REQUIRE(find_event(events, w, fsnotifier::flags::move_from, p2.filename().native()));
         BOOST_REQUIRE(find_event(events, w2, fsnotifier::flags::move_to, p3.filename().native()));
     }
@@ -213,15 +214,15 @@ SEASTAR_THREAD_TEST_CASE(test_shutdown_notifier) {
     fsnotifier fsn;
 
     auto p = tmp.path() / "kossa.dat";
-    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get0();
+    auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get();
 
     f.close().get();
 
-    auto w = fsn.create_watch(tmp.path().native(), fsnotifier::flags::delete_child).get0();
+    auto w = fsn.create_watch(tmp.path().native(), fsnotifier::flags::delete_child).get();
     auto fut = fsn.wait();
 
     fsn.shutdown();
 
-    auto events = fut.get0();
+    auto events = fut.get();
     BOOST_REQUIRE(events.empty());
 }

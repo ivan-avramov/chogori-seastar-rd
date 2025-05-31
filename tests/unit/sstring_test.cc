@@ -20,11 +20,18 @@
  */
 
 #define BOOST_TEST_MODULE core
+// formatting of std::optional was introduced in fmt 10
+#define FMT_VERSION_OPTIONAL_FORMAT 100000
 
-#include <boost/test/included/unit_test.hpp>
+#include <boost/test/unit_test.hpp>
 #include <seastar/core/sstring.hh>
 #include <list>
+#include <fmt/ranges.h>
+#if FMT_VERSION >= FMT_VERSION_OPTIONAL_FORMAT
+#include <fmt/std.h>
+#endif
 
+using namespace std::literals;
 using namespace seastar;
 
 BOOST_AUTO_TEST_CASE(test_make_sstring) {
@@ -51,9 +58,36 @@ BOOST_AUTO_TEST_CASE(test_add_literal_to_sstring) {
     BOOST_REQUIRE_EQUAL("x" + sstring("y"), sstring("xy"));
 }
 
+BOOST_AUTO_TEST_CASE(test_front) {
+    sstring s("abcde");
+    BOOST_CHECK_EQUAL(s.front(), 'a');
+    BOOST_CHECK_EQUAL(std::as_const(s).front(), 'a');
+}
+
 BOOST_AUTO_TEST_CASE(test_find_sstring) {
     BOOST_REQUIRE_EQUAL(sstring("abcde").find('b'), 1u);
     BOOST_REQUIRE_EQUAL(sstring("babcde").find('b',1), 2u);
+}
+
+BOOST_AUTO_TEST_CASE(test_find_sstring_compatible) {
+    auto check_find = [](const char* s1, const char* s2, size_t pos) {
+        const auto xpos_ss = sstring(s1).find(s2, pos);
+        const auto xpos_std = std::string(s1).find(s2, pos);
+
+        // verify that std::string really has the same behavior as we just tested for sstring
+        if (xpos_ss == sstring::npos) {  // sstring::npos may not equal std::string::npos ?
+            BOOST_REQUIRE_EQUAL(xpos_std, std::string::npos);
+        } else {
+            BOOST_REQUIRE_EQUAL(xpos_ss, xpos_std);
+        }
+    };
+
+    check_find("", "", 0);
+    check_find("", "", 1);
+    check_find("abcde", "", 0);
+    check_find("abcde", "", 1);
+    check_find("abcde", "", 5);
+    check_find("abcde", "", 6);
 }
 
 BOOST_AUTO_TEST_CASE(test_not_find_sstring) {
@@ -63,10 +97,69 @@ BOOST_AUTO_TEST_CASE(test_not_find_sstring) {
 BOOST_AUTO_TEST_CASE(test_str_find_sstring) {
     BOOST_REQUIRE_EQUAL(sstring("abcde").find("bc"), 1u);
     BOOST_REQUIRE_EQUAL(sstring("abcbcde").find("bc", 2), 3u);
+    BOOST_REQUIRE_EQUAL(sstring("abcde").find("abcde"), 0u);
+    BOOST_REQUIRE_EQUAL(sstring("abcde").find("", 5), 5u);
+    BOOST_REQUIRE_EQUAL(sstring("ababcbdbef").find("bef"), 7u);
+    BOOST_REQUIRE_EQUAL(sstring("").find("", 0), 0u);
 }
 
 BOOST_AUTO_TEST_CASE(test_str_not_find_sstring) {
     BOOST_REQUIRE_EQUAL(sstring("abcde").find("x"), sstring::npos);
+    BOOST_REQUIRE_EQUAL(sstring("abcdefg").find("cde", 6), sstring::npos);
+    BOOST_REQUIRE_EQUAL(sstring("abcdefg").find("cde", 4), sstring::npos);
+    BOOST_REQUIRE_EQUAL(sstring("ababcbdbe").find("bcd"), sstring::npos);
+    BOOST_REQUIRE_EQUAL(sstring("").find("", 1), sstring::npos);
+    BOOST_REQUIRE_EQUAL(sstring("abc").find("abcde"), sstring::npos);
+}
+
+BOOST_AUTO_TEST_CASE(test_str_starts_with) {
+    BOOST_CHECK(std::string("abcdefg").starts_with("abcdefg"));
+    BOOST_CHECK(sstring("abcdefg").starts_with("abcdefg"));
+    BOOST_CHECK(sstring("abcdefg").starts_with("ab"sv));
+    BOOST_CHECK(sstring("abcde").starts_with('a'));
+    BOOST_CHECK(sstring("abcde").starts_with("ab"));
+    BOOST_CHECK(sstring("abcdefg").starts_with(""));
+
+    BOOST_CHECK(!sstring("abcde").starts_with("cde"));
+    BOOST_CHECK(!sstring("abcde").starts_with('b'));
+    BOOST_CHECK(!sstring("abcdefg").starts_with("cde"sv));
+    BOOST_CHECK(!sstring("abcdefg").starts_with("ab\0"sv));
+}
+
+BOOST_AUTO_TEST_CASE(test_str_ends_with) {
+    BOOST_CHECK(std::string("abcdefg").ends_with("abcdefg"));
+    BOOST_CHECK(sstring("abcdefg").ends_with("abcdefg"));
+    BOOST_CHECK(sstring("abcdefg").ends_with("efg"sv));
+    BOOST_CHECK(sstring("abcde").ends_with('e'));
+    BOOST_CHECK(sstring("abcde").ends_with("de"));
+    BOOST_CHECK(sstring("abcdefg").ends_with(""));
+
+    BOOST_CHECK(!sstring("abcde").ends_with("abc"));
+    BOOST_CHECK(!sstring("abcde").ends_with('b'));
+    BOOST_CHECK(!sstring("abcdefg").ends_with("abc"sv));
+    BOOST_CHECK(!sstring("abcdefg").ends_with("efg\0"sv));
+}
+
+BOOST_AUTO_TEST_CASE(test_str_contains) {
+    BOOST_CHECK(sstring("abcde").starts_with("ab"sv));
+    BOOST_CHECK(sstring("abcde").starts_with('a'));
+    BOOST_CHECK(sstring("abcde").starts_with("ab"));
+    BOOST_CHECK(sstring("abcde").starts_with(""));
+
+    BOOST_CHECK(sstring("abcde").contains("bc"sv));
+    BOOST_CHECK(sstring("abcde").contains("bc"));
+    BOOST_CHECK(sstring("abcde").contains('c'));
+
+    BOOST_CHECK(sstring("abcde").contains("de"sv));
+    BOOST_CHECK(sstring("abcde").contains("de"));
+
+    BOOST_CHECK(!sstring("abcde").contains("bad"));
+    BOOST_CHECK(!sstring("abcde").contains("bce"));
+    BOOST_CHECK(!sstring("abcde").contains("x"));
+    BOOST_CHECK(!sstring("abcde").contains('x'));
+    BOOST_CHECK(!sstring("abcde").contains("ab\0"sv));
+    BOOST_CHECK(!sstring("abcde").contains("bc\0"sv));
+    BOOST_CHECK(!sstring("abcde").contains("de\0"sv));
 }
 
 BOOST_AUTO_TEST_CASE(test_substr_sstring) {
@@ -184,3 +277,53 @@ BOOST_AUTO_TEST_CASE(test_nul_termination) {
         BOOST_REQUIRE(!strncmp(s1.c_str(), s2.c_str(), std::min(s1.size(), s2.size())));
     }
 }
+
+BOOST_AUTO_TEST_CASE(test_resize_and_overwrite) {
+    static constexpr size_t new_size = 42;
+    static constexpr char pattern = 's';
+    {
+        // the size of new content is identical to the specified count
+        sstring s;
+        s.resize_and_overwrite(new_size, [](char* buf, size_t n) {
+            memset(buf, pattern, n);
+            return n;
+        });
+        BOOST_CHECK_EQUAL(s, sstring(new_size, pattern));
+    }
+    {
+        // the size of new content is smaller than the specified count
+        static constexpr size_t smaller_size = new_size / 2;
+        sstring s;
+        s.resize_and_overwrite(new_size, [](char* buf, size_t n) {
+            memset(buf, pattern, smaller_size);
+            return smaller_size;
+        });
+        BOOST_CHECK_EQUAL(s, sstring(smaller_size, pattern));
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE(test_compares_left_hand_not_string) {
+    // mostly a compile test for non-sstring left-hand-side
+    BOOST_REQUIRE("a" == sstring("a"));
+    BOOST_REQUIRE(std::string("a") == sstring("a"));
+    BOOST_REQUIRE(std::string_view("a") == sstring("a"));
+
+#ifdef __cpp_lib_three_way_comparison
+    BOOST_REQUIRE("a" < sstring("b"));
+    BOOST_REQUIRE(std::string("a") < sstring("b"));
+#endif
+}
+
+#if FMT_VERSION >= 90000
+
+BOOST_AUTO_TEST_CASE(test_fmt) {
+#if FMT_VERSION >= FMT_VERSION_OPTIONAL_FORMAT
+    // https://github.com/llvm/llvm-project/issues/68849
+    std::ignore = fmt::format("{}", std::optional(sstring{"hello"}));
+#endif
+    std::vector<sstring> strings;
+    std::ignore = fmt::format("{}", strings);
+}
+
+#endif

@@ -20,6 +20,7 @@
  */
 
 #include <seastar/core/posix.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/core/linux-aio.hh>
 #include <sys/time.h>
@@ -39,7 +40,7 @@ using namespace seastar::internal::linux_abi;
 // Runs func(), and also adds the number of context switches
 // that happened during func() to counter.
 template <typename Counter, typename Func>
-typename std::result_of<Func()>::type
+typename std::invoke_result_t<Func>
 with_ctxsw_counting(Counter& counter, Func&& func) {
     struct count_guard {
         Counter& counter;
@@ -63,7 +64,7 @@ bool filesystem_has_good_aio_support(sstring directory, bool verbose) {
     aio_context_t ioctx = {};
     auto r = io_setup(1, &ioctx);
     throw_system_error_on(r == -1, "io_setup");
-    auto cleanup = defer([&] { io_destroy(ioctx); });
+    auto cleanup = defer([&] () noexcept { io_destroy(ioctx); });
     auto fname = directory + "/fsqual.tmp";
     auto fd = file_desc::open(fname, O_CREAT|O_EXCL|O_RDWR|O_DIRECT, 0600);
     unlink(fname.c_str());
@@ -72,6 +73,7 @@ bool filesystem_has_good_aio_support(sstring directory, bool verbose) {
     auto bufsize = 4096;
     auto ctxsw = 0;
     auto buf = aligned_alloc(4096, 4096);
+    auto del = defer([&] () noexcept { ::free(buf); });
     for (int i = 0; i < nr; ++i) {
         struct iocb cmd;
         cmd = make_write_iocb(fd.get(), bufsize*i, buf, bufsize);
@@ -79,7 +81,7 @@ bool filesystem_has_good_aio_support(sstring directory, bool verbose) {
         with_ctxsw_counting(ctxsw, [&] {
             auto r = io_submit(ioctx, 1, cmds);
             throw_system_error_on(r == -1, "io_submit");
-            assert(r == 1);
+            SEASTAR_ASSERT(r == 1);
         });
         struct io_event ioev;
         int n = -1;
@@ -87,9 +89,9 @@ bool filesystem_has_good_aio_support(sstring directory, bool verbose) {
             n = io_getevents(ioctx, 1, 1, &ioev, nullptr);
             throw_system_error_on((n == -1) && (errno != EINTR) , "io_getevents");
         } while (n == -1);
-        assert(n == 1);
+        SEASTAR_ASSERT(n == 1);
         throw_kernel_error(long(ioev.res));
-        assert(long(ioev.res) == bufsize);
+        SEASTAR_ASSERT(long(ioev.res) == bufsize);
     }
     auto rate = float(ctxsw) / nr;
     bool ok = rate < 0.1;

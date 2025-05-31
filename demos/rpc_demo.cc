@@ -19,6 +19,8 @@
  * Copyright 2015 Cloudius Systems
  */
 #include <cmath>
+#include <iostream>
+#include <ranges>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/rpc/rpc.hh>
@@ -35,14 +37,14 @@ struct serializer {
 template <typename T, typename Output>
 inline
 void write_arithmetic_type(Output& out, T v) {
-    static_assert(std::is_arithmetic<T>::value, "must be arithmetic type");
+    static_assert(std::is_arithmetic_v<T>, "must be arithmetic type");
     return out.write(reinterpret_cast<const char*>(&v), sizeof(T));
 }
 
 template <typename T, typename Input>
 inline
 T read_arithmetic_type(Input& in) {
-    static_assert(std::is_arithmetic<T>::value, "must be arithmetic type");
+    static_assert(std::is_arithmetic_v<T>, "must be arithmetic type");
     T v;
     in.read(reinterpret_cast<char*>(&v), sizeof(T));
     return v;
@@ -227,7 +229,7 @@ int main(int ac, char** av) {
             (void)sleep(400ms).then([test12] () mutable {
                 // server is configured for 10MB max, throw 25MB worth of requests at it.
                 auto now = rpc::rpc_clock_type::now();
-                return parallel_for_each(boost::irange(0, 25), [test12, now] (int idx) mutable {
+                return parallel_for_each(std::views::iota(0, 25), [test12, now] (int idx) mutable {
                     return test12(*client, 100, uninitialized_string(1'000'000)).then([idx, now] {
                         auto later = rpc::rpc_clock_type::now();
                         auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(later - now);

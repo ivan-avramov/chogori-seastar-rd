@@ -22,10 +22,24 @@
 #pragma once
 
 #include <seastar/net/stack.hh>
-#include <iostream>
 #include <seastar/net/inet_address.hh>
+#include <seastar/util/assert.hh>
+#include <seastar/util/log.hh>
 
 namespace seastar {
+
+extern logger seastar_logger;
+
+namespace internal {
+
+namespace native_stack_net_stats {
+
+inline thread_local std::array<uint64_t, max_scheduling_groups()> bytes_sent = {};
+inline thread_local std::array<uint64_t, max_scheduling_groups()> bytes_received = {};
+
+};
+
+}
 
 namespace net {
 
@@ -103,6 +117,9 @@ public:
     keepalive_params get_keepalive_parameters() const override;
     int get_sockopt(int level, int optname, void* data, size_t len) const override;
     void set_sockopt(int level, int optname, const void* data, size_t len) override;
+    socket_address local_address() const noexcept override;
+    socket_address remote_address() const noexcept override;
+    virtual future<> wait_input_shutdown() override;
 };
 
 template <typename Protocol>
@@ -115,10 +132,10 @@ public:
 
     virtual future<connected_socket> connect(socket_address sa, socket_address local, transport proto = transport::TCP) override {
         //TODO: implement SCTP
-        assert(proto == transport::TCP);
+        SEASTAR_ASSERT(proto == transport::TCP);
 
         // FIXME: local is ignored since native stack does not support multiple IPs yet
-        assert(sa.as_posix_sockaddr().sa_family == AF_INET);
+        SEASTAR_ASSERT(sa.as_posix_sockaddr().sa_family == AF_INET);
 
         _conn = make_lw_shared<typename Protocol::connection>(_proto.connect(sa));
         return _conn->connected().then([conn = _conn]() mutable {
@@ -129,7 +146,7 @@ public:
 
     virtual void set_reuseaddr(bool reuseaddr) override {
         // FIXME: implement
-        std::cerr << "Reuseaddr is not supported by native stack" << std::endl;
+        seastar_logger.error("Reuseaddr is not supported by native stack");
     }
 
     virtual bool get_reuseaddr() const override {
@@ -167,6 +184,8 @@ public:
         }
         return _conn->wait_for_data().then([this] {
             _buf = _conn->read();
+            auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+            internal::native_stack_net_stats::bytes_received[sg_id] += _buf.len();
             _cur_frag = 0;
             _eof = !_buf.len();
             return get();
@@ -187,10 +206,16 @@ public:
         : _conn(std::move(conn)) {}
     using data_sink_impl::put;
     virtual future<> put(packet p) override {
+        auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+        internal::native_stack_net_stats::bytes_sent[sg_id] += p.len();
         return _conn->send(std::move(p));
     }
     virtual future<> close() override {
         return _conn->close_write();
+    }
+    virtual bool can_batch_flushes() const noexcept override { return true; }
+    virtual void on_batch_flush_error() noexcept override {
+        _conn->close_read();
     }
 };
 
@@ -232,7 +257,7 @@ native_connected_socket_impl<Protocol>::get_nodelay() const {
 template <typename Protocol>
 void native_connected_socket_impl<Protocol>::set_keepalive(bool keepalive) {
     // FIXME: implement
-    std::cerr << "Keepalive is not supported by native stack" << std::endl;
+    seastar_logger.error("Keepalive is not supported by native stack");
 }
 template <typename Protocol>
 bool native_connected_socket_impl<Protocol>::get_keepalive() const {
@@ -243,7 +268,7 @@ bool native_connected_socket_impl<Protocol>::get_keepalive() const {
 template <typename Protocol>
 void native_connected_socket_impl<Protocol>::set_keepalive_parameters(const keepalive_params&) {
     // FIXME: implement
-    std::cerr << "Keepalive parameters are not supported by native stack" << std::endl;
+    seastar_logger.error("Keepalive parameters are not supported by native stack");
 }
 
 template <typename Protocol>
@@ -260,6 +285,21 @@ void native_connected_socket_impl<Protocol>::set_sockopt(int level, int optname,
 template<typename Protocol>
 int native_connected_socket_impl<Protocol>::get_sockopt(int level, int optname, void* data, size_t len) const {
     throw std::runtime_error("Getting custom socket options is not supported for native stack");
+}
+
+template<typename Protocol>
+socket_address native_connected_socket_impl<Protocol>::local_address() const noexcept {
+    return {_conn->local_ip(), _conn->local_port()};
+}
+
+template<typename Protocol>
+socket_address native_connected_socket_impl<Protocol>::remote_address() const noexcept {
+    return {_conn->foreign_ip(), _conn->foreign_port()};
+}
+
+template <typename Protocol>
+future<> native_connected_socket_impl<Protocol>::wait_input_shutdown() {
+    return _conn->wait_input_shutdown();
 }
 
 }
